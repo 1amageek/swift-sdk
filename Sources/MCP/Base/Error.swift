@@ -39,6 +39,11 @@ public enum MCPError: Swift.Error, Sendable {
 
     // MCP specific errors
     case urlElicitationRequired(message: String, elicitations: [URLElicitationInfo])  // -32042
+    case headerMismatch(String?)  // -32020
+    case missingRequiredClientCapability(required: [String: Value])  // -32021
+    case unsupportedProtocolVersion(requested: String, supported: [String])  // -32022
+    case negotiationFailed(String?)
+    case localLimitExceeded(resource: String, limit: Int)
 
     // Transport specific errors
     case connectionClosed
@@ -54,6 +59,11 @@ public enum MCPError: Swift.Error, Sendable {
         case .internalError: return -32603
         case .serverError(let code, _): return code
         case .urlElicitationRequired: return -32042
+        case .headerMismatch: return -32020
+        case .missingRequiredClientCapability: return -32021
+        case .unsupportedProtocolVersion: return -32022
+        case .negotiationFailed: return -32023
+        case .localLimitExceeded: return -32024
         case .connectionClosed: return -32000
         case .transportError: return -32001
         }
@@ -93,6 +103,16 @@ extension MCPError: LocalizedError {
             return "Server error: \(message)"
         case .urlElicitationRequired(let message, _):
             return "URL elicitation required: \(message)"
+        case .headerMismatch(let detail):
+            return "Header mismatch" + (detail.map { ": \($0)" } ?? "")
+        case .missingRequiredClientCapability(let required):
+            return "Missing required client capability: \(required.keys.sorted().joined(separator: ", "))"
+        case .unsupportedProtocolVersion(let requested, let supported):
+            return "Unsupported protocol version: \(requested) (supported: \(supported.joined(separator: ", ")))"
+        case .negotiationFailed(let detail):
+            return "Protocol negotiation failed" + (detail.map { ": \($0)" } ?? "")
+        case .localLimitExceeded(let resource, let limit):
+            return "Local limit exceeded for \(resource): \(limit)"
         case .connectionClosed:
             return "Connection closed"
         case .transportError(let error):
@@ -116,6 +136,16 @@ extension MCPError: LocalizedError {
             return "Server-defined error occurred"
         case .urlElicitationRequired:
             return "The server requires user authentication or input via external URL"
+        case .headerMismatch:
+            return "Ensure protocol headers match the corresponding request fields"
+        case .missingRequiredClientCapability:
+            return "Declare the required client capability before retrying the request"
+        case .unsupportedProtocolVersion:
+            return "Retry with one of the protocol versions advertised by the server"
+        case .negotiationFailed:
+            return "Check that both peers advertise a mutually supported protocol version"
+        case .localLimitExceeded:
+            return "Reduce the request or increase the owning operation's configured bound"
         case .connectionClosed:
             return "The connection to the server was closed"
         case .transportError(let error):
@@ -138,6 +168,9 @@ extension MCPError: LocalizedError {
                 return "Visit \(first.url) to complete the required authentication or input"
             }
             return "Complete the required URL-based elicitation"
+        case .headerMismatch, .missingRequiredClientCapability, .unsupportedProtocolVersion,
+            .negotiationFailed, .localLimitExceeded:
+            return nil
         case .connectionClosed:
             return "Try reconnecting to the server"
         default:
@@ -203,6 +236,37 @@ extension MCPError: Codable {
                 ["elicitations": Value.array(elicitationsData.map { .object($0) })],
                 forKey: .data
             )
+        case .headerMismatch(let detail):
+            try container.encode(errorDescription ?? "Header mismatch", forKey: .message)
+            if let detail {
+                try container.encode(["detail": detail], forKey: .data)
+            }
+        case .missingRequiredClientCapability(let required):
+            try container.encode(errorDescription ?? "Missing required client capability", forKey: .message)
+            try container.encode(
+                ["requiredCapabilities": Value.object(required)],
+                forKey: .data
+            )
+        case .unsupportedProtocolVersion(let requested, let supported):
+            try container.encode(errorDescription ?? "Unsupported protocol version", forKey: .message)
+            try container.encode(
+                Value.object([
+                    "requested": .string(requested),
+                    "supported": .array(supported.map(Value.string)),
+                ]),
+                forKey: .data
+            )
+        case .negotiationFailed(let detail):
+            try container.encode(errorDescription ?? "Protocol negotiation failed", forKey: .message)
+            if let detail {
+                try container.encode(["detail": detail], forKey: .data)
+            }
+        case .localLimitExceeded(let resource, let limit):
+            try container.encode(errorDescription ?? "Local limit exceeded", forKey: .message)
+            try container.encode(
+                Value.object(["resource": .string(resource), "limit": .int(limit)]),
+                forKey: .data
+            )
         case .connectionClosed:
             try container.encode(errorDescription ?? "Unknown error", forKey: .message)
         case .transportError(let error):
@@ -219,6 +283,13 @@ extension MCPError: Codable {
         let code = try container.decode(Int.self, forKey: .code)
         let message = try container.decode(String.self, forKey: .message)
         let data = try container.decodeIfPresent([String: Value].self, forKey: .data)
+
+        let invalidStructuredData: (String) -> DecodingError = { detail in
+            DecodingError.dataCorrupted(.init(
+                codingPath: decoder.codingPath + [CodingKeys.data],
+                debugDescription: detail
+            ))
+        }
 
         // Helper to extract detail from data, falling back to message if needed
         let unwrapDetail: (String?) -> String? = { fallback in
@@ -257,6 +328,53 @@ extension MCPError: Codable {
                 }
             }
             self = .urlElicitationRequired(message: message, elicitations: elicitations)
+        case -32020:
+            self = .headerMismatch(unwrapDetail(message))
+        case -32021:
+            guard let requiredValue = data?["requiredCapabilities"],
+                case .object(let required) = requiredValue
+            else {
+                throw invalidStructuredData(
+                    "Missing or invalid requiredCapabilities for error code -32021"
+                )
+            }
+            self = .missingRequiredClientCapability(required: required)
+        case -32022:
+            guard let requested = data?["requested"]?.stringValue else {
+                throw invalidStructuredData(
+                    "Missing or invalid requested for error code -32022"
+                )
+            }
+            guard case .array(let values)? = data?["supported"] else {
+                throw invalidStructuredData(
+                    "Missing or invalid supported for error code -32022"
+                )
+            }
+            var supported: [String] = []
+            supported.reserveCapacity(values.count)
+            for value in values {
+                guard let version = value.stringValue else {
+                    throw invalidStructuredData(
+                        "supported must contain only strings for error code -32022"
+                    )
+                }
+                supported.append(version)
+            }
+            self = .unsupportedProtocolVersion(requested: requested, supported: supported)
+        case -32023:
+            self = .negotiationFailed(unwrapDetail(message))
+        case -32024:
+            guard let resource = data?["resource"]?.stringValue else {
+                throw invalidStructuredData(
+                    "Missing or invalid resource for error code -32024"
+                )
+            }
+            guard let limit = data?["limit"]?.intValue else {
+                throw invalidStructuredData(
+                    "Missing or invalid limit for error code -32024"
+                )
+            }
+            self = .localLimitExceeded(resource: resource, limit: limit)
         case -32000:
             self = .connectionClosed
         case -32001:
@@ -293,6 +411,22 @@ extension MCPError: Equatable {
             return c1 == c2 && m1 == m2
         case (.urlElicitationRequired(let m1, let e1), .urlElicitationRequired(let m2, let e2)):
             return m1 == m2 && e1 == e2
+        case (.headerMismatch(let a), .headerMismatch(let b)):
+            return a == b
+        case (.missingRequiredClientCapability(let a), .missingRequiredClientCapability(let b)):
+            return a == b
+        case (
+            .unsupportedProtocolVersion(let requestedA, let supportedA),
+            .unsupportedProtocolVersion(let requestedB, let supportedB)
+        ):
+            return requestedA == requestedB && supportedA == supportedB
+        case (.negotiationFailed(let a), .negotiationFailed(let b)):
+            return a == b
+        case (
+            .localLimitExceeded(let resourceA, let limitA),
+            .localLimitExceeded(let resourceB, let limitB)
+        ):
+            return resourceA == resourceB && limitA == limitB
         case (.connectionClosed, .connectionClosed): return true
         case (.transportError(let a), .transportError(let b)):
             return a.localizedDescription == b.localizedDescription
@@ -322,6 +456,18 @@ extension MCPError: Hashable {
         case .urlElicitationRequired(let message, let elicitations):
             hasher.combine(message)
             hasher.combine(elicitations)
+        case .headerMismatch(let detail):
+            hasher.combine(detail)
+        case .missingRequiredClientCapability(let required):
+            hasher.combine(required)
+        case .unsupportedProtocolVersion(let requested, let supported):
+            hasher.combine(requested)
+            hasher.combine(supported)
+        case .negotiationFailed(let detail):
+            hasher.combine(detail)
+        case .localLimitExceeded(let resource, let limit):
+            hasher.combine(resource)
+            hasher.combine(limit)
         case .connectionClosed:
             break
         case .transportError(let error):

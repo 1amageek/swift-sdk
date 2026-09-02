@@ -63,11 +63,11 @@ model trees.
 | JSON-RPC compatibility | Existing legacy request, response, notification, and arbitrary `Value` payloads remain decodable and encodable without semantic loss. |
 | Era-aware wire rules | Supported legacy-family behavior (`2024-11-05` through `2025-11-25`) remains tolerant where the existing API requires it; `2026-07-28` requires request `_meta` and response `resultType` where the modern schema requires them. |
 | Metadata | Modern request metadata contains required protocol version and client capability fields; optional client info and extension fields remain distinguishable. Result cache hints and opaque request state are preserved as values. |
-| MRTR values | Input-required results distinguish complete from input-required state, preserve opaque `requestState`, and carry keyed input requests/responses without inventing application decisions. |
+| MRTR values | Input-required results distinguish complete from input-required state, preserve opaque `requestState`, and carry keyed input requests/responses without inventing application decisions. `InputResponse` stores only its raw wire value; the caller supplies the originating method to `validate(for:)`, because the open union may be ambiguous when extension fields are present. |
 | Subscription values | Subscription filters, acknowledgement metadata, and terminal results are represented as protocol data; stream ownership remains in orchestration/transport. |
-| Header derivation | Only statically reachable `properties` are visited. Invalid or duplicate `x-mcp-header` annotations exclude the tool; null/missing values are omitted; string/integer/boolean values use the specified safe encoding. |
-| Schema boundary | Tool-header schema walks are local and positively bounded by the resolver; network `$ref` targets are never fetched. Client owns paginated tool discovery, `maxToolListPages = 64`, and cursor-cycle failures. |
-| Failure | Missing/invalid modern fields, mismatched versions, unsupported capabilities, invalid header annotations, and local schema-walk exhaustion produce typed failures rather than empty success. Client reports pagination-bound and cursor-cycle failures. |
+| Header derivation | The resolver uses an iterative worklist over the finite acyclic caller-owned `Value`; only statically reachable `properties` produce bindings. Non-properties branches are inspected for forbidden annotations. Work is O(schema nodes), temporary storage is O(schema depth), and immutable bindings live for one operation. Invalid or duplicate `x-mcp-header` annotations exclude the tool; null/missing values are omitted; string/integer/boolean values use the specified safe encoding. |
+| Schema boundary | Tool-header schema walks are finite and local to the caller-owned acyclic `Value`; no arbitrary node-count threshold is imposed, no network `$ref` is dereferenced, and Base owns traversal complexity. Client owns paginated tool discovery, `maxToolListPages = 64`, and cursor-cycle failures. |
+| Failure | Missing/invalid modern fields, mismatched versions, unsupported capabilities, and invalid header annotations produce typed failures rather than empty success. A finite schema walk terminates without an arbitrary size rejection; malformed or unsupported values remain failures, and network `$ref` targets are never fetched. Client reports pagination-bound and cursor-cycle failures. |
 
 `ConnectionInfo`, `ProtocolEra`, and typed modern failure values are internal or
 public only at the API boundary where the module design requires them. Their
@@ -90,14 +90,17 @@ sequenceDiagram
     Core-->>Owner: typed value or typed failure
 ```
 
-Header derivation is a bounded, pure operation over one tool schema and one
-argument value. It has no I/O and cannot mutate the tool registry or a
+Header derivation is an iterative, finite, pure operation over one caller-owned
+tool schema and one argument value. It performs O(schema nodes) work with
+O(schema depth) temporary traversal storage and retains immutable bindings only
+for that operation. It has no I/O and cannot mutate the tool registry or a
 connection.
 
 ## State, Ownership, and Lifecycle
 
 The codec and resolver retain no cross-request mutable state. A caller owns the
-input and result values for the operation. Opaque request state is copied as a
+input and result values for the operation. Resolver worklists and immutable
+bindings live only for one operation. Opaque request state is copied as a
 protocol value only for the request lifetime; it is not used as a server-side
 session key by Base.
 
@@ -108,8 +111,10 @@ session key by Base.
 - A modern result must identify whether it is complete or requires input. A
   legacy result without `resultType` is interpreted as complete only on the
   legacy path.
-- Resolver traversal stops at its positive local schema-walk bound and never
-  dereferences a network `$ref`.
+- Resolver traversal uses an iterative worklist over a finite acyclic
+  caller-owned `Value`, performs O(schema nodes) work with O(schema depth)
+  temporary storage, has no arbitrary schema-node rejection threshold, and
+  never dereferences a network `$ref`.
 - Client owns paginated tool discovery, with positive `maxToolListPages` default
   `64`; cursor cycles and page-bound exhaustion are failures, not infinite loops.
 - Unknown extension fields are preserved where the existing `Value`/metadata
@@ -119,10 +124,11 @@ session key by Base.
 
 Focused protocol-core tests must prove legacy wire fixtures, modern required
 fields, MRTR/subscription round trips, invalid result/input combinations,
-header annotation validation, safe value encoding, and the network-ref
-no-dereference rule. These tests own Base invariants; Client and
-Server integration tests must not replace them.
+header annotation validation, safe value encoding, finite deep-schema success
+without an arbitrary size threshold, and the network-ref no-dereference rule.
+These tests own Base invariants; Client and Server integration tests must not
+replace them.
 
 Changes to wire fields, error codes, metadata requirements, schema traversal, or
-the positive limit require rechecking the module master and Client, Server, and
-Transport designs.
+the traversal complexity contract require rechecking the module master and
+Client, Server, and Transport designs.

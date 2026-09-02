@@ -278,6 +278,17 @@ stateDiagram-v2
 
 ## Failure, Concurrency, and Constraints
 
+### Protocol-core schema traversal
+
+Protocol-core schema traversal operates on the finite acyclic caller-owned
+`Value` using an iterative worklist. It performs O(schema nodes) work with
+O(schema depth) temporary traversal storage and retains immutable bindings only
+for the one operation. It has no arbitrary schema-size rejection threshold and
+never dereferences a network `$ref`; Base owns traversal complexity. A finite
+schema therefore succeeds regardless of size or depth unless it contains an
+invalid annotation or unsupported value. Client still owns paginated discovery
+bounds and cursor-cycle failures.
+
 - Actors serialize connection, pending-request, handler-registration, and
   semantic subscription mutations. External I/O occurs outside unrelated
   critical state sections.
@@ -292,8 +303,9 @@ stateDiagram-v2
 - `maxRounds = 10`, `maxToolListPages = 64`, and `maxSubscriptions = 1024` are
   positive configurable safety limits. Tests must prove both the normal path and
   the limit failure path.
-- A protocol-core schema walk is local and bounded. It never resolves a
-  network `$ref` while deriving tool headers.
+- A protocol-core schema walk is finite and local to caller-owned values. It
+  never resolves a network `$ref` while deriving tool headers; Base owns the
+  traversal complexity and Client owns discovery pagination bounds.
 
 ## Verification and Change Impact
 
