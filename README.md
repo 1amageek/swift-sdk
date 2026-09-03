@@ -1,19 +1,22 @@
 # MCP Swift SDK
 
-Official Swift SDK for the [Model Context Protocol][mcp] (MCP).
+Swift SDK for the [Model Context Protocol][mcp] (MCP), based on the
+[official Swift SDK][upstream-swift-sdk].
 
 ## Overview
 
 The Model Context Protocol (MCP) defines a standardized way
 for applications to communicate with AI and ML models.
-This Swift SDK implements both client and server components
-according to the [2025-11-25][mcp-spec-2025-11-25] (latest) version
-of the MCP specification.
+This Swift SDK implements client and server components for the
+[2025-11-25][mcp-spec-2025-11-25] specification and the opt-in
+2026-07-28 scored core. The 2026 support does not include Tasks or
+the conformance suite's report-only and pending extensions.
 
 ## Table of contents
 
 - [Requirements](#requirements)
 - [Installation](#installation)
+- [Protocol Versions](#protocol-versions)
 - [Client Usage](#client-usage)
   - [Basic Client Setup](#basic-client-setup)
   - [Transport Options for Clients](#transport-options-for-clients)
@@ -61,7 +64,7 @@ of the MCP specification.
 
 ## Requirements
 
-- Swift 6.0+ (Xcode 16+)
+- Swift 6.1+ (Xcode 16.4+)
 
 See the [Platform Availability](#platform-availability) section below
 for platform-specific requirements.
@@ -74,7 +77,7 @@ Add the following to your `Package.swift` file:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.11.0")
+    .package(url: "https://github.com/1amageek/swift-sdk.git", from: "0.13.0")
 ]
 ```
 
@@ -86,6 +89,27 @@ Then add the dependency to your target:
     dependencies: [
         .product(name: "MCP", package: "swift-sdk")
     ]
+)
+```
+
+## Protocol Versions
+
+The existing `connect(transport:)` API retains the 2025-11-25 behavior. Use
+explicit negotiation for the 2026-07-28 protocol:
+
+```swift
+import Foundation
+import MCP
+
+let client = Client(name: "MyApp", version: "1.0.0")
+let transport = HTTPClientTransport(
+    endpoint: URL(string: "http://localhost:8080/mcp")!,
+    streaming: true
+)
+let connection = try await client.connect(
+    transport: transport,
+    preference: .modernOnly,
+    delivery: .http
 )
 ```
 
@@ -1625,7 +1649,7 @@ For pre-1.0 releases,
 minor version increments (0.X.0) may contain breaking changes.
 
 For details about changes in each release,
-see the [GitHub Releases page](https://github.com/modelcontextprotocol/swift-sdk/releases).
+see the [GitHub Releases page](https://github.com/1amageek/swift-sdk/releases).
 
 ## License
 
@@ -1633,3 +1657,4 @@ This project is licensed under Apache 2.0 for new contributions, with existing c
 
 [mcp]: https://modelcontextprotocol.io
 [mcp-spec-2025-11-25]: https://modelcontextprotocol.io/specification/2025-11-25
+[upstream-swift-sdk]: https://github.com/modelcontextprotocol/swift-sdk

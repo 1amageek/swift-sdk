@@ -88,6 +88,10 @@ public enum HTTPResponse: Sendable {
     /// 200 OK with data body (typically JSON).
     case data(Data, headers: [String: String] = [:])
 
+    /// A data body with an explicit status code, used when a JSON-RPC error
+    /// must retain its original bytes while mapping to modern HTTP status.
+    case dataWithStatus(statusCode: Int, data: Data, headers: [String: String] = [:])
+
     /// 200 OK with SSE streaming body.
     case stream(AsyncThrowingStream<Data, Swift.Error>, headers: [String: String] = [:])
 
@@ -101,13 +105,15 @@ public enum HTTPResponse: Sendable {
         switch self {
         case .accepted: 202
         case .ok, .data, .stream: 200
+        case .dataWithStatus(let statusCode, _, _): statusCode
         case .error(let code, _, _, _): code
         }
     }
 
     public var headers: [String: String] {
         switch self {
-        case .accepted(let headers), .ok(let headers), .data(_, let headers), .stream(_, let headers):
+        case .accepted(let headers), .ok(let headers), .data(_, let headers),
+                .dataWithStatus(_, _, let headers), .stream(_, let headers):
             return headers
         case .error(_, _, let sessionID, let extraHeaders):
             var headers: [String: String] = [HTTPHeaderName.contentType: ContentType.json]
@@ -123,6 +129,8 @@ public enum HTTPResponse: Sendable {
         case .accepted, .ok, .stream:
             return nil
         case .data(let data, _):
+            return data
+        case .dataWithStatus(_, let data, _):
             return data
         case .error(_, let error, _, _):
             let errorBody: [String: Any] = [
@@ -144,6 +152,9 @@ public enum HTTPResponse: Sendable {
 public enum HTTPHeaderName {
     public static let sessionID = "MCP-Session-Id"
     public static let protocolVersion = "MCP-Protocol-Version"
+    public static let method = "Mcp-Method"
+    public static let name = "Mcp-Name"
+    public static let parameterPrefix = "Mcp-Param-"
     public static let lastEventID = "Last-Event-ID"
     public static let accept = "Accept"
     public static let contentType = "Content-Type"

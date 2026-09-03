@@ -1,6 +1,10 @@
 import Foundation
 import Testing
 
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+
 #if canImport(CryptoKit)
 import CryptoKit
 #endif
@@ -437,6 +441,38 @@ struct OAuthAuthorizationTests {
 
     // MARK: - Token Type Validation
 
+    @Test("Token endpoint authentication applies basic post and none wire contracts")
+    func testTokenEndpointAuthenticationMethods() async throws {
+        let endpoint = URL(string: "https://auth.example.com/token")!
+
+        var basicRequest = URLRequest(url: endpoint)
+        var basicBody: [String: String] = [:]
+        try await OAuthConfiguration.TokenEndpointAuthentication.clientSecretBasic(
+            clientID: "client", clientSecret: "secret"
+        ).apply(to: &basicRequest, bodyParameters: &basicBody, tokenEndpoint: endpoint)
+        let expectedBasic = Data("client:secret".utf8).base64EncodedString()
+        #expect(basicRequest.value(forHTTPHeaderField: "Authorization") == "Basic \(expectedBasic)")
+        #expect(basicBody["client_id"] == nil)
+        #expect(basicBody["client_secret"] == nil)
+
+        var postRequest = URLRequest(url: endpoint)
+        var postBody: [String: String] = [:]
+        try await OAuthConfiguration.TokenEndpointAuthentication.clientSecretPost(
+            clientID: "client", clientSecret: "secret"
+        ).apply(to: &postRequest, bodyParameters: &postBody, tokenEndpoint: endpoint)
+        #expect(postRequest.value(forHTTPHeaderField: "Authorization") == nil)
+        #expect(postBody["client_id"] == "client")
+        #expect(postBody["client_secret"] == "secret")
+
+        var noneRequest = URLRequest(url: endpoint)
+        var noneBody: [String: String] = [:]
+        try await OAuthConfiguration.TokenEndpointAuthentication.none(clientID: "client")
+            .apply(to: &noneRequest, bodyParameters: &noneBody, tokenEndpoint: endpoint)
+        #expect(noneRequest.value(forHTTPHeaderField: "Authorization") == nil)
+        #expect(noneBody["client_id"] == "client")
+        #expect(noneBody["client_secret"] == nil)
+    }
+
     @Test("makePrivateKeyJWTAssertion — token type empty string is rejected")
     func testEmptyTokenTypeIsRejected() throws {
         // OAuthTokenResponse decodes token_type from JSON; simulate an empty value via
@@ -533,56 +569,81 @@ struct OAuthAuthorizationTests {
     @Test("prepareAuthorization does nothing when proactiveRefreshWindowSeconds is zero")
     func testPrepareAuthorizationSkipsWhenWindowIsZero() async throws {
         let storage = InMemoryTokenStorage()
-        // Token expires in 50 s — within a large proactive window but not within the 30 s default skew.
+        let endpoint = URL(string: "https://example.com/mcp")!
+        let authorizationServer = URL(string: "https://auth.example.com")!
         storage.save(OAuthAccessToken(
             value: "original-token",
             tokenType: "Bearer",
             expiresAt: Date().addingTimeInterval(50),
             scopes: [],
-            authorizationServer: nil,
+            resource: endpoint,
+            authorizationServer: authorizationServer,
             refreshToken: "some-refresh-token"
         ))
         let config = OAuthConfiguration(
             authentication: .none(clientID: "client"),
             proactiveRefreshWindowSeconds: 0
         )
-        let authorizer = OAuthAuthorizer(configuration: config, tokenStorage: storage)
+        let tokenClient = MockTokenClient()
+        let authorizer = OAuthAuthorizer(
+            configuration: config,
+            tokenStorage: storage,
+            urlValidator: MockURLValidator(),
+            discoveryClient: MockDiscoveryClient(authorizationServer: authorizationServer),
+            tokenEndpointClient: tokenClient,
+            clientRegistrar: MockClientRegistrar(),
+            authCodeFlow: MockAuthCodeFlow()
+        )
 
         try await authorizer.prepareAuthorization(
-            for: URL(string: "https://example.com/mcp")!,
+            for: endpoint,
             session: .shared
         )
 
-        // Token must be unchanged — proactive refresh is disabled.
         #expect(storage.load()?.value == "original-token")
+        #expect(tokenClient.requestCallCount == 0)
     }
 
-    @Test("prepareAuthorization does nothing without cached authorization server metadata")
-    func testPrepareAuthorizationSkipsWithoutCachedASMetadata() async throws {
+    @Test("prepareAuthorization discovers binding before refreshing a persisted token")
+    func testPrepareAuthorizationDiscoversBindingBeforeRefresh() async throws {
         let storage = InMemoryTokenStorage()
-        // Token expires in 50 s — within the 400 s proactive window.
+        let endpoint = URL(string: "https://example.com/mcp")!
+        let authorizationServer = URL(string: "https://auth.example.com")!
         storage.save(OAuthAccessToken(
             value: "original-token",
             tokenType: "Bearer",
             expiresAt: Date().addingTimeInterval(50),
             scopes: [],
-            authorizationServer: nil,
+            resource: endpoint,
+            authorizationServer: authorizationServer,
             refreshToken: "some-refresh-token"
         ))
         let config = OAuthConfiguration(
             authentication: .none(clientID: "client"),
             proactiveRefreshWindowSeconds: 400
         )
-        // No handleChallenge call → authorizationServerMetadata remains nil.
-        let authorizer = OAuthAuthorizer(configuration: config, tokenStorage: storage)
+        let discovery = MockDiscoveryClient(authorizationServer: authorizationServer)
+        let tokenClient = MockTokenClient()
+        let authorizer = OAuthAuthorizer(
+            configuration: config,
+            tokenStorage: storage,
+            urlValidator: MockURLValidator(),
+            discoveryClient: discovery,
+            tokenEndpointClient: tokenClient,
+            clientRegistrar: MockClientRegistrar(),
+            authCodeFlow: MockAuthCodeFlow()
+        )
 
         try await authorizer.prepareAuthorization(
-            for: URL(string: "https://example.com/mcp")!,
+            for: endpoint,
             session: .shared
         )
 
-        // Token must be unchanged — refresh requires cached AS metadata.
-        #expect(storage.load()?.value == "original-token")
+        #expect(discovery.fetchProtectedResourceMetadataCallCount == 1)
+        #expect(discovery.fetchAuthorizationServerMetadataCallCount == 1)
+        #expect(tokenClient.requestCallCount == 1)
+        #expect(storage.load()?.value == "mock-access-token")
+        #expect(storage.load()?.resource == endpoint)
     }
 
     // MARK: - WWW-Authenticate Bare Scheme Detection

@@ -99,6 +99,7 @@ import Testing
 
     final class MockURLProtocol: URLProtocol, @unchecked Sendable {
         static let requestHandlerStorage = RequestHandlerStorage()
+        private let loadingState = URLProtocolLoadingState()
 
         static func setHandler(
             _ handler: @Sendable @escaping (URLRequest) async throws -> (HTTPURLResponse, Data)
@@ -124,16 +125,20 @@ import Testing
             Task {
                 do {
                     let (response, data) = try await self.executeHandler(for: request)
+                    guard loadingState.beginCompletion() else { return }
                     client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
                     client?.urlProtocol(self, didLoad: data)
                     client?.urlProtocolDidFinishLoading(self)
                 } catch {
+                    guard loadingState.beginCompletion() else { return }
                     client?.urlProtocol(self, didFailWithError: error)
                 }
             }
         }
 
-        override func stopLoading() {}
+        override func stopLoading() {
+            loadingState.stop()
+        }
 
         static func verifyCallCounts(
             _ expected: [URL: Int],
@@ -146,6 +151,39 @@ import Testing
                     "Expected \(expectedCount) call(s) to \(url.lastPathComponent), got \(actual)",
                     sourceLocation: sourceLocation
                 )
+            }
+        }
+    }
+
+    private enum HTTPResponseCorrelationEcho: MCP.Method {
+        static let name = "test/http-response-correlation"
+
+        struct Parameters: Hashable, Codable, Sendable {
+            let value: String
+        }
+
+        struct Result: Hashable, Codable, Sendable {
+            let value: String
+        }
+    }
+
+    private actor SwappedModernHTTPResponseCoordinator {
+        private struct Waiting: Sendable {
+            let id: ID
+            let value: String
+            let continuation: CheckedContinuation<(ID, String), Never>
+        }
+
+        private var waiting: Waiting?
+
+        func response(for id: ID, value: String) async -> (ID, String) {
+            if let waiting {
+                self.waiting = nil
+                waiting.continuation.resume(returning: (id, waiting.value))
+                return (waiting.id, value)
+            }
+            return await withCheckedContinuation { continuation in
+                waiting = Waiting(id: id, value: value, continuation: continuation)
             }
         }
     }
@@ -495,6 +533,114 @@ import Testing
             }
         }
 
+        @Test("Persisted OAuth tokens require current issuer and resource binding", .httpClientTransportSetup)
+        func testPersistedOAuthTokenBindingBeforeFirstPOST() async throws {
+            let testEndpoint = URL(string: "https://localhost:8080/persisted-token")!
+            let resourceMetadataURL = URL(
+                string: "https://localhost:8080/.well-known/oauth-protected-resource/persisted-token")!
+            let authorizationServer = URL(string: "https://localhost:8080/auth")!
+            let asMetadataURL = URL(
+                string: "https://localhost:8080/.well-known/oauth-authorization-server/auth")!
+            let expectedResource = URL(string: "https://localhost:8080/persisted-token")!
+            let responseData = #"{"jsonrpc":"2.0","result":{"ok":true},"id":44}"#.data(
+                using: .utf8)!
+            let cases: [(authorizationServer: URL, resource: URL, expectedHeader: String?)] = [
+                (URL(string: "https://foreign.example/auth")!, expectedResource, nil),
+                (authorizationServer, URL(string: "https://localhost:8080/other")!, nil),
+                (authorizationServer, expectedResource, "Bearer persisted-token"),
+            ]
+
+            for testCase in cases {
+                let storage = InMemoryTokenStorage()
+                storage.save(OAuthAccessToken(
+                    value: "persisted-token",
+                    tokenType: "Bearer",
+                    expiresAt: Date().addingTimeInterval(3600),
+                    scopes: ["files:read"],
+                    resource: testCase.resource,
+                    authorizationServer: testCase.authorizationServer,
+                    refreshToken: nil,
+                    clientID: "test-client"
+                ))
+
+                let expectedHeader = testCase.expectedHeader
+                await MockURLProtocol.requestHandlerStorage.setHandler {
+                    [testEndpoint, resourceMetadataURL, authorizationServer, asMetadataURL, expectedResource, responseData] request in
+                    guard let url = request.url else {
+                        throw NSError(
+                            domain: "MockURLProtocolError",
+                            code: 0,
+                            userInfo: [NSLocalizedDescriptionKey: "Missing request URL"])
+                    }
+
+                    switch url {
+                    case resourceMetadataURL:
+                        let metadata = #"{ "resource": "\#(expectedResource.absoluteString)", "authorization_servers": ["\#(authorizationServer.absoluteString)"] }"#
+                            .data(using: .utf8)!
+                        let response = HTTPURLResponse(
+                            url: url,
+                            statusCode: 200,
+                            httpVersion: "HTTP/1.1",
+                            headerFields: ["Content-Type": "application/json"])!
+                        return (response, metadata)
+
+                    case asMetadataURL:
+                        let metadata = #"{ "issuer": "\#(authorizationServer.absoluteString)" }"#
+                            .data(using: .utf8)!
+                        let response = HTTPURLResponse(
+                            url: url,
+                            statusCode: 200,
+                            httpVersion: "HTTP/1.1",
+                            headerFields: ["Content-Type": "application/json"])!
+                        return (response, metadata)
+
+                    case testEndpoint:
+                        #expect(
+                            request.value(forHTTPHeaderField: "Authorization") == expectedHeader)
+                        let response = HTTPURLResponse(
+                            url: url,
+                            statusCode: 200,
+                            httpVersion: "HTTP/1.1",
+                            headerFields: ["Content-Type": "application/json"])!
+                        return (response, responseData)
+
+                    default:
+                        throw NSError(
+                            domain: "MockURLProtocolError",
+                            code: 0,
+                            userInfo: [
+                                NSLocalizedDescriptionKey:
+                                    "Unexpected URL: \(url.absoluteString)"
+                            ])
+                    }
+                }
+
+                let configuration = URLSessionConfiguration.ephemeral
+                configuration.protocolClasses = [MockURLProtocol.self]
+                let transport = HTTPClientTransport(
+                    endpoint: testEndpoint,
+                    configuration: configuration,
+                    streaming: false,
+                    authorizer: OAuthAuthorizer(
+                        configuration: .init(authentication: .none(clientID: "test-client")),
+                        tokenStorage: storage
+                    ),
+                    logger: nil
+                )
+
+                try await transport.connect()
+                try await transport.send(
+                    #"{"jsonrpc":"2.0","method":"ping","id":44}"#.data(using: .utf8)!)
+                await transport.disconnect()
+
+                if expectedHeader == nil {
+                    #expect(storage.load() == nil)
+                } else {
+                    #expect(storage.load()?.value == "persisted-token")
+                }
+            }
+        }
+
         @Test("OAuth scope step-up retries after 403 insufficient_scope", .httpClientTransportSetup)
         func testOAuthStepUpRetryAfter403InsufficientScope() async throws {
             let configuration = URLSessionConfiguration.ephemeral
@@ -656,8 +802,8 @@ import Testing
             await transport.disconnect()
         }
 
-        @Test("OAuth scope upgrade tracking is scoped per operation", .httpClientTransportSetup)
-        func testOAuthScopeUpgradeTrackingPerOperation() async throws {
+        @Test("OAuth scope upgrade tracking is scoped per request", .httpClientTransportSetup)
+        func testOAuthScopeUpgradeTrackingPerRequest() async throws {
             let configuration = URLSessionConfiguration.ephemeral
             configuration.protocolClasses = [MockURLProtocol.self]
 
@@ -702,8 +848,8 @@ import Testing
                 switch url {
                 case testEndpoint:
                     let body = String(data: request.readBody() ?? Data(), encoding: .utf8) ?? ""
-                    let isOperationA = body.contains(#""method":"tools/callA""#)
-                    let isOperationB = body.contains(#""method":"tools/callB""#)
+                    let isOperationA = body.contains(#""id":61"#)
+                    let isOperationB = body.contains(#""id":62"#)
                     let authorization = request.value(forHTTPHeaderField: "Authorization")
 
                     if authorization == nil {
@@ -888,7 +1034,7 @@ import Testing
             let stream = await transport.receive()
             var iterator = stream.makeAsyncIterator()
 
-            let operationAData = #"{"jsonrpc":"2.0","method":"tools/callA","id":61}"#.data(
+            let operationAData = #"{"jsonrpc":"2.0","method":"tools/call","id":61}"#.data(
                 using: .utf8)!
             do {
                 try await transport.send(operationAData)
@@ -904,7 +1050,7 @@ import Testing
                 throw error
             }
 
-            let operationBData = #"{"jsonrpc":"2.0","method":"tools/callB","id":62}"#.data(
+            let operationBData = #"{"jsonrpc":"2.0","method":"tools/call","id":62}"#.data(
                 using: .utf8)!
             try await transport.send(operationBData)
 
@@ -2392,6 +2538,108 @@ import Testing
 
                 try await transport.send(messageData)
                 await transport.disconnect()
+            }
+
+            @Test(
+                "Modern HTTP responses cannot complete a different concurrent request",
+                .httpClientTransportSetup,
+                .timeLimit(.minutes(1))
+            )
+            func testModernHTTPResponseCorrelation() async throws {
+                let configuration = URLSessionConfiguration.ephemeral
+                configuration.protocolClasses = [MockURLProtocol.self]
+                let coordinator = SwappedModernHTTPResponseCoordinator()
+                let transport = HTTPClientTransport(
+                    endpoint: testEndpoint,
+                    configuration: configuration,
+                    streaming: false,
+                    protocolVersion: Version.modern,
+                    logger: nil
+                )
+                let client = Client(name: "CorrelationClient", version: "1")
+
+                await MockURLProtocol.requestHandlerStorage.setHandler {
+                    [testEndpoint, coordinator] request in
+                    guard let data = request.readBody() else {
+                        throw ProtocolCoreError.malformedMessage("request body is missing")
+                    }
+                    let message = try MessageCodec(era: .modern).decode(
+                        AnyRequest.self,
+                        from: data
+                    )
+                    let responseData: Data
+                    if message.method == ServerDiscover.name {
+                        let result = DiscoverResult(
+                            supportedVersions: [Version.modern],
+                            cacheHint: try CacheHint(scope: .private, ttlMs: 0)
+                        )
+                        responseData = try MessageCodec(era: .modern).encode(
+                            ServerDiscover.response(id: message.id, result: result)
+                        )
+                    } else {
+                        guard message.method == HTTPResponseCorrelationEcho.name,
+                            case .object(let fields) = message.params,
+                            let value = fields["value"]?.stringValue
+                        else {
+                            throw ProtocolCoreError.malformedMessage("unexpected request")
+                        }
+                        let (responseID, responseValue) = await coordinator.response(
+                            for: message.id,
+                            value: value
+                        )
+                        responseData = try MessageCodec(era: .modern).encode(
+                            HTTPResponseCorrelationEcho.response(
+                                id: responseID,
+                                result: .init(value: "response-for-\(responseValue)")
+                            )
+                        )
+                    }
+                    let response = HTTPURLResponse(
+                        url: testEndpoint,
+                        statusCode: 200,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: ["Content-Type": "application/json"]
+                    )!
+                    return (response, responseData)
+                }
+
+                _ = try await client.connect(
+                    transport: transport,
+                    preference: .modernOnly,
+                    delivery: .http
+                )
+                let first = Task {
+                    do {
+                        _ = try await client.sendModern(
+                            HTTPResponseCorrelationEcho.request(.init(value: "first"))
+                        )
+                        return false
+                    } catch let error as ProtocolCoreError {
+                        return error == .malformedMessage(
+                            "HTTP response id does not match request"
+                        )
+                    } catch {
+                        return false
+                    }
+                }
+                let second = Task {
+                    do {
+                        _ = try await client.sendModern(
+                            HTTPResponseCorrelationEcho.request(.init(value: "second"))
+                        )
+                        return false
+                    } catch let error as ProtocolCoreError {
+                        return error == .malformedMessage(
+                            "HTTP response id does not match request"
+                        )
+                    } catch {
+                        return false
+                    }
+                }
+
+                #expect(await first.value)
+                #expect(await second.value)
+                await client.disconnect()
             }
         #endif  // !canImport(FoundationNetworking)
     }

@@ -24,6 +24,79 @@ public actor Server {
         /// Disabling strict mode allows the server to be more lenient with non-compliant
         /// clients, though this may lead to undefined behavior.
         public var strict: Bool
+
+        /// The maximum number of active modern subscriptions.
+        public var maxSubscriptions: Int {
+            didSet {
+                precondition(maxSubscriptions > 0, "maxSubscriptions must be positive")
+            }
+        }
+
+        /// The maximum number of pages inspected while resolving a tool schema.
+        public var maxToolSchemaLookupPages: Int {
+            didSet {
+                precondition(
+                    maxToolSchemaLookupPages > 0,
+                    "maxToolSchemaLookupPages must be positive"
+                )
+            }
+        }
+
+        public init(
+            strict: Bool = false,
+            maxSubscriptions: Int = 1024,
+            maxToolSchemaLookupPages: Int = 64
+        ) {
+            precondition(maxSubscriptions > 0, "maxSubscriptions must be positive")
+            precondition(maxToolSchemaLookupPages > 0, "maxToolSchemaLookupPages must be positive")
+            self.strict = strict
+            self.maxSubscriptions = maxSubscriptions
+            self.maxToolSchemaLookupPages = maxToolSchemaLookupPages
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case strict
+            case maxSubscriptions
+            case maxToolSchemaLookupPages
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let maxSubscriptions = try container.decodeIfPresent(
+                Int.self,
+                forKey: .maxSubscriptions
+            ) ?? 1024
+            let maxToolSchemaLookupPages = try container.decodeIfPresent(
+                Int.self,
+                forKey: .maxToolSchemaLookupPages
+            ) ?? 64
+            guard maxSubscriptions > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .maxSubscriptions,
+                    in: container,
+                    debugDescription: "maxSubscriptions must be positive"
+                )
+            }
+            guard maxToolSchemaLookupPages > 0 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .maxToolSchemaLookupPages,
+                    in: container,
+                    debugDescription: "maxToolSchemaLookupPages must be positive"
+                )
+            }
+            self.init(
+                strict: try container.decodeIfPresent(Bool.self, forKey: .strict) ?? false,
+                maxSubscriptions: maxSubscriptions,
+                maxToolSchemaLookupPages: maxToolSchemaLookupPages
+            )
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(strict, forKey: .strict)
+            try container.encode(maxSubscriptions, forKey: .maxSubscriptions)
+            try container.encode(maxToolSchemaLookupPages, forKey: .maxToolSchemaLookupPages)
+        }
     }
 
     /// Implementation information
@@ -133,11 +206,11 @@ public actor Server {
     }
 
     /// Server information
-    private let serverInfo: Server.Info
+    let serverInfo: Server.Info
     /// The server connection
-    private var connection: (any Transport)?
+    var connection: (any Transport)?
     /// The server logger
-    private var logger: Logger? {
+    var logger: Logger? {
         get async {
             await connection?.logger
         }
@@ -162,11 +235,22 @@ public actor Server {
     public var configuration: Configuration
 
     /// Request handlers
-    private var methodHandlers: [String: RequestHandlerBox] = [:]
+    var methodHandlers: [String: RequestHandlerBox] = [:]
+    /// Modern-only request handlers. They are intentionally separate from the
+    /// legacy handler table so modern result semantics cannot leak into legacy
+    /// responses.
+    var modernMethodHandlers: [String: ModernRequestHandlerBox] = [:]
     /// Notification handlers
-    private var notificationHandlers: [String: [NotificationHandlerBox]] = [:]
+    var notificationHandlers: [String: [NotificationHandlerBox]] = [:]
     /// Pending request tasks (for cancellation support)
     private var pendingRequestTasks: [ID: Task<Response<AnyMethod>, Error>] = [:]
+
+    /// Modern request tasks are keyed by transport exchange identity. A JSON-RPC
+    /// id is not unique across independent HTTP POSTs and is therefore never used
+    /// for this table.
+    var modernRequestTasks: [ExchangeID: Task<Void, Never>] = [:]
+    var modernStreamRequestTasks: [ID: Task<Void, Never>] = [:]
+    var modernSubscriptions: [ModernSubscriptionKey: ModernSubscription] = [:]
 
     /// Pending requests sent to the client, awaiting responses
     private var pendingRequests: [ID: AnyPendingRequest] = [:]
@@ -215,62 +299,11 @@ public actor Server {
             "Server started", metadata: ["name": "\(name)", "version": "\(version)"]
         )
 
-        // Start message handling loop
+        // The raw byte loop remains the compatibility path. Exchange-aware
+        // transports additionally provide a second, request-scoped stream for
+        // modern HTTP; both loops share this actor's existing lifecycle task.
         task = Task {
-            do {
-                let stream = await transport.receive()
-                for try await data in stream {
-                    if Task.isCancelled { break }  // Check cancellation inside loop
-
-                    var requestID: ID?
-                    do {
-                        // Attempt to decode as batch first, then as individual response, request, or notification
-                        let decoder = JSONDecoder()
-                        if let batch = try? decoder.decode(Server.Batch.self, from: data) {
-                            try await handleBatch(batch)
-                        } else if let response = try? decoder.decode(AnyResponse.self, from: data) {
-                            await handleResponse(response)
-                        } else if let request = try? decoder.decode(AnyRequest.self, from: data) {
-                            // Handle request in a separate task to avoid blocking the receive loop
-                            Task {
-                                _ = try? await self.handleRequest(request, sendResponse: true)
-                            }
-                        } else if let message = try? decoder.decode(AnyMessage.self, from: data) {
-                            try await handleMessage(message)
-                        } else {
-                            // Try to extract request ID from raw JSON if possible
-                            if let json = try? JSONDecoder().decode(
-                                [String: Value].self, from: data),
-                                let idValue = json["id"]
-                            {
-                                if let strValue = idValue.stringValue {
-                                    requestID = .string(strValue)
-                                } else if let intValue = idValue.intValue {
-                                    requestID = .number(intValue)
-                                }
-                            }
-                            throw MCPError.parseError("Invalid message format")
-                        }
-                    } catch let error where MCPError.isResourceTemporarilyUnavailable(error) {
-                        // Resource temporarily unavailable, retry after a short delay
-                        try? await Task.sleep(for: .milliseconds(10))
-                        continue
-                    } catch {
-                        await logger?.error(
-                            "Error processing message", metadata: ["error": "\(error)"])
-                        let response = AnyMethod.response(
-                            id: requestID ?? .random,
-                            error: error as? MCPError
-                                ?? MCPError.internalError(error.localizedDescription)
-                        )
-                        try? await send(response)
-                    }
-                }
-            } catch {
-                await logger?.error(
-                    "Fatal error in message handling loop", metadata: ["error": "\(error)"])
-            }
-            await logger?.debug("Server finished", metadata: [:])
+            await self.runMessageLoops(transport: transport)
         }
     }
 
@@ -278,6 +311,9 @@ public actor Server {
     public func stop() async {
         task?.cancel()
         task = nil
+
+        await finishModernSubscriptions()
+        cancelModernRequests()
 
         // Clear pending requests with errors
         let pendingRequestsToCancel = self.pendingRequests
@@ -308,15 +344,44 @@ public actor Server {
         /// (e.g. transports closing an SSE stream mid-call per SEP-1699).
         package let id: ID
 
+        /// The protocol era selected for this request.
+        public let era: ProtocolEra
+
+        /// Modern request metadata. Legacy dispatches expose `nil`.
+        public let requestMetadata: RequestMetadata?
+
+        /// Opaque state supplied by the client for this independent request.
+        public let requestState: String?
+
+        /// Input responses supplied by the client for this independent request.
+        public let inputResponses: InputResponses?
+
         /// The originating HTTP request, if the active transport conforms to
         /// ``HTTPContextProviding``. `nil` for transports that don't carry HTTP
         /// context (stdio, in-memory) or for handlers reached off the dispatch
         /// path.
         public let httpContext: HTTPRequest?
 
-        package init(id: ID, httpContext: HTTPRequest?) {
+        /// The package-internal exchange identity for modern HTTP requests.
+        /// This is not a JSON-RPC id and is not exposed as a public value.
+        package let exchangeID: ExchangeID?
+
+        package init(
+            id: ID,
+            era: ProtocolEra = .legacy,
+            requestMetadata: RequestMetadata? = nil,
+            requestState: String? = nil,
+            inputResponses: InputResponses? = nil,
+            httpContext: HTTPRequest? = nil,
+            exchangeID: ExchangeID? = nil
+        ) {
             self.id = id
+            self.era = era
+            self.requestMetadata = requestMetadata
+            self.requestState = requestState
+            self.inputResponses = inputResponses
             self.httpContext = httpContext
+            self.exchangeID = exchangeID
         }
     }
 
@@ -385,6 +450,12 @@ public actor Server {
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
 
         let notificationData = try encoder.encode(notification)
+        if try await sendModernNotificationIfNeeded(
+            method: N.name,
+            data: notificationData
+        ) {
+            return
+        }
         try await connection.send(notificationData)
     }
 
@@ -676,7 +747,7 @@ public actor Server {
     }
 
     /// Process a batch of requests and/or notifications
-    private func handleBatch(_ batch: Batch) async throws {
+    func handleBatch(_ batch: Batch) async throws {
         await logger?.trace("Processing batch request", metadata: ["size": "\(batch.items.count)"])
 
         if batch.items.isEmpty {
@@ -735,7 +806,7 @@ public actor Server {
     ///   - request: The request to handle
     ///   - sendResponse: Whether to send the response immediately (true) or return it (false)
     /// - Returns: The response when sendResponse is false
-    private func handleRequest(_ request: Request<AnyMethod>, sendResponse: Bool = true)
+    func handleRequest(_ request: Request<AnyMethod>, sendResponse: Bool = true)
         async throws -> Response<AnyMethod>?
     {
         // Check if this is a pre-processed error request (empty method)
@@ -846,7 +917,7 @@ public actor Server {
         }
     }
 
-    private func handleMessage(_ message: Message<AnyNotification>) async throws {
+    func handleMessage(_ message: Message<AnyNotification>) async throws {
         await logger?.trace(
             "Processing notification",
             metadata: ["method": "\(message.method)"])
@@ -876,7 +947,7 @@ public actor Server {
         }
     }
 
-    private func handleResponse(_ response: Response<AnyMethod>) async {
+    func handleResponse(_ response: Response<AnyMethod>) async {
         if let pendingRequest = self.removePendingResponse(id: response.id) {
             switch response.result {
             case .success(let value):

@@ -42,6 +42,14 @@ let package = Package(
                     name: "EventSource", package: "eventsource",
                     condition: .when(platforms: [.macOS, .iOS, .tvOS, .visionOS, .watchOS, .macCatalyst])),
             ],
+            exclude: [
+                "DESIGN.md",
+                "Base/DESIGN.md",
+                "Base/Authorization/DESIGN.md",
+                "Base/Transports/DESIGN.md",
+                "Client/DESIGN.md",
+                "Server/DESIGN.md",
+            ],
             swiftSettings: [
                 .enableUpcomingFeature("StrictConcurrency")
             ]
@@ -52,6 +60,7 @@ let package = Package(
                 "MCP",
                 .product(name: "SystemPackage", package: "swift-system"),
                 .product(name: "Logging", package: "swift-log"),
+                .product(name: "NIOConcurrencyHelpers", package: "swift-nio"),
                 .product(
                     name: "EventSource", package: "eventsource",
                     condition: .when(platforms: [.macOS, .iOS, .tvOS, .visionOS, .watchOS, .macCatalyst])),
@@ -66,7 +75,8 @@ let package = Package(
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "NIOHTTP1", package: "swift-nio"),
             ],
-            path: "Sources/MCPConformance/Server"
+            path: "Sources/MCPConformance/Server",
+            exclude: ["DESIGN.md"]
         ),
         .executableTarget(
             name: "MCPConformanceClient",
@@ -74,7 +84,8 @@ let package = Package(
                 "MCP",
                 .product(name: "Logging", package: "swift-log"),
             ],
-            path: "Sources/MCPConformance/Client"
+            path: "Sources/MCPConformance/Client",
+            exclude: ["DESIGN.md"]
         )
     ]
 )

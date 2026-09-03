@@ -171,12 +171,24 @@ public struct ProtocolVersionValidator: HTTPRequestValidator {
 
         // Skip for non-POST methods (GET/DELETE don't carry protocol version)
         // Actually, per spec, all subsequent requests should include it
-        guard let version = request.header(HTTPHeaderName.protocolVersion) else {
+        guard let rawVersion = request.header(HTTPHeaderName.protocolVersion) else {
             // Per spec: if not received, assume default version
             return nil
         }
+        // Modern admission owns OWS normalization. Keep the legacy validator's
+        // exact value comparison unchanged for existing callers.
+        let version = context.supportedProtocolVersions.contains(Version.modern)
+            ? rawVersion.trimmingCharacters(in: .whitespacesAndNewlines)
+            : rawVersion
 
         guard context.supportedProtocolVersions.contains(version) else {
+            // Modern admission performs its own typed version check after
+            // deployment validators run. The context includes the modern
+            // revision only on that path; retain legacy error compatibility
+            // for the existing validator contract.
+            if context.supportedProtocolVersions.contains(Version.modern) {
+                return nil
+            }
             let supported = context.supportedProtocolVersions.sorted().joined(separator: ", ")
             return .error(
                 statusCode: 400,
@@ -267,13 +279,19 @@ public struct OriginValidator: HTTPRequestValidator {
     /// Allows requests from `localhost`, `127.0.0.1`, and `[::1]` with the specified port.
     public static func localhost(port: Int? = nil) -> OriginValidator {
         let portPattern = port.map { String($0) } ?? "*"
+        let hostWithoutPort = port == nil
+            ? ["127.0.0.1", "localhost", "[::1]"]
+            : []
+        let originWithoutPort = port == nil
+            ? ["http://127.0.0.1", "http://localhost", "http://[::1]"]
+            : []
         return OriginValidator(
-            allowedHosts: [
+            allowedHosts: hostWithoutPort + [
                 "127.0.0.1:\(portPattern)",
                 "localhost:\(portPattern)",
                 "[::1]:\(portPattern)",
             ],
-            allowedOrigins: [
+            allowedOrigins: originWithoutPort + [
                 "http://127.0.0.1:\(portPattern)",
                 "http://localhost:\(portPattern)",
                 "http://[::1]:\(portPattern)",

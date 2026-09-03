@@ -53,7 +53,7 @@ import Logging
 /// // The transport will automatically handle SSE events
 /// // and deliver them through the client's notification handlers
 /// ```
-public actor HTTPClientTransport: Transport {
+public actor HTTPClientTransport: Transport, HTTPRequestSendingTransport {
     /// The server endpoint URL to connect to
     public let endpoint: URL
     private let session: URLSession
@@ -187,7 +187,7 @@ public actor HTTPClientTransport: Transport {
 
         setupInitialSessionIDSignal()
 
-        if streaming {
+        if streaming, protocolVersion != Version.modern {
             streamingTask = Task { await startListeningForServerEvents() }
         }
 
@@ -216,10 +216,26 @@ public actor HTTPClientTransport: Transport {
     /// Updates the protocol version used for `MCP-Protocol-Version` headers on subsequent requests.
     public func updateNegotiatedProtocolVersion(_ version: String) {
         self.protocolVersion = version
+        guard isConnected, streaming else { return }
+        if version == Version.modern {
+            streamingTask?.cancel()
+            streamingTask = nil
+        } else if streamingTask == nil {
+            streamingTask = Task { await startListeningForServerEvents() }
+        }
     }
 
     /// Sends data through an HTTP POST request
     public func send(_ data: Data) async throws {
+        try await sendRequestData(data, headers: [:])
+    }
+
+    package func send(_ data: Data, headers: [String: String]) async throws {
+        try Self.validateAdditionalHeaders(headers)
+        try await sendRequestData(data, headers: headers)
+    }
+
+    private func sendRequestData(_ data: Data, headers: [String: String]) async throws {
         guard isConnected else {
             throw MCPError.internalError("Transport not connected")
         }
@@ -239,7 +255,12 @@ public actor HTTPClientTransport: Transport {
         }
 
         var attempts = 0
+        var scopeUpgradeAttempts = 0
         let operationKey = jsonRPCOperationKey(from: data)
+        let expectedResponseID =
+            protocolVersion == Version.modern
+            ? try Self.modernRequestID(from: data)
+            : nil
 
         while true {
             var request = URLRequest(url: endpoint)
@@ -255,7 +276,7 @@ public actor HTTPClientTransport: Transport {
                 request.addValue(protocolVersion, forHTTPHeaderField: HTTPHeaderName.protocolVersion)
             }
 
-            if let sessionID = sessionID {
+            if protocolVersion != Version.modern, let sessionID = sessionID {
                 request.addValue(sessionID, forHTTPHeaderField: HTTPHeaderName.sessionID)
             }
 
@@ -264,19 +285,37 @@ public actor HTTPClientTransport: Transport {
             }
 
             request = requestModifier(request)
+            for (name, value) in headers {
+                request.setValue(value, forHTTPHeaderField: name)
+            }
 
             do {
                 #if os(Linux)
-                    let (responseData, response) = try await session.data(for: request)
-                    try await processResponse(response: response, data: responseData)
+                    let (responseData, response) = try await session.mcpTransportData(for: request)
+                    try await processResponse(
+                        response: response,
+                        data: responseData,
+                        expectedResponseID: expectedResponseID
+                    )
                 #else
                     let (responseStream, response) = try await session.bytes(for: request)
-                    try await processResponse(response: response, stream: responseStream)
+                    try await processResponse(
+                        response: response,
+                        stream: responseStream,
+                        expectedResponseID: expectedResponseID
+                    )
                 #endif
                 return
             } catch let authError as HTTPAuthenticationChallengeError {
                 guard let authorizer else {
                     throw mapAuthenticationChallengeError(authError)
+                }
+
+                if authError.statusCode == 403 {
+                    scopeUpgradeAttempts += 1
+                    guard scopeUpgradeAttempts <= authorizer.maxScopeUpgradeAttempts else {
+                        throw mapAuthenticationChallengeError(authError)
+                    }
                 }
 
                 let handled: Bool
@@ -304,8 +343,34 @@ public actor HTTPClientTransport: Transport {
         }
     }
 
+    private static func validateAdditionalHeaders(_ headers: [String: String]) throws {
+        for (name, value) in headers {
+            guard !name.isEmpty, name.utf8.allSatisfy(isHeaderNameByte) else {
+                throw ProtocolCoreError.invalidHeaderValue("HTTP header name is invalid")
+            }
+            guard !value.utf8.contains(0x0A), !value.utf8.contains(0x0D) else {
+                throw ProtocolCoreError.invalidHeaderValue(
+                    "HTTP header value contains a line break")
+            }
+        }
+    }
+
+    private static func isHeaderNameByte(_ byte: UInt8) -> Bool {
+        switch byte {
+        case 0x21, 0x23...0x27, 0x2A, 0x2B, 0x2D, 0x2E, 0x30...0x39,
+            0x41...0x5A, 0x5E, 0x5F, 0x60, 0x61...0x7A, 0x7C, 0x7E:
+            return true
+        default:
+            return false
+        }
+    }
+
     #if os(Linux)
-        private func processResponse(response: URLResponse, data: Data) async throws {
+        private func processResponse(
+            response: URLResponse,
+            data: Data,
+            expectedResponseID: ID?
+        ) async throws {
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw MCPError.internalError("Invalid HTTP response")
             }
@@ -321,13 +386,23 @@ public actor HTTPClientTransport: Transport {
                 logger.debug("Session ID received", metadata: ["sessionID": "\(newSessionID)"])
             }
 
+            if isModernJSONRPCErrorResponse(httpResponse, contentType: contentType) {
+                try Self.validateModernDirectResponse(data, expectedID: expectedResponseID)
+                messageContinuation.yield(data)
+                return
+            }
+
             try processHTTPResponse(httpResponse, contentType: contentType)
             guard case 200..<300 = httpResponse.statusCode else { return }
 
             if contentType.contains(ContentType.sse) {
+                if expectedResponseID != nil {
+                    throw MCPError.internalError("SSE responses aren't supported on Linux")
+                }
                 logger.warning("SSE responses aren't fully supported on Linux")
                 messageContinuation.yield(data)
             } else if contentType.contains(ContentType.json) {
+                try Self.validateModernDirectResponse(data, expectedID: expectedResponseID)
                 logger.trace("Received JSON response", metadata: ["size": "\(data.count)"])
                 messageContinuation.yield(data)
             } else {
@@ -335,9 +410,11 @@ public actor HTTPClientTransport: Transport {
             }
         }
     #else
-        private func processResponse(response: URLResponse, stream: URLSession.AsyncBytes)
-            async throws
-        {
+        private func processResponse(
+            response: URLResponse,
+            stream: URLSession.AsyncBytes,
+            expectedResponseID: ID?
+        ) async throws {
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw MCPError.internalError("Invalid HTTP response")
             }
@@ -353,12 +430,25 @@ public actor HTTPClientTransport: Transport {
                 logger.debug("Session ID received", metadata: ["sessionID": "\(newSessionID)"])
             }
 
+            if isModernJSONRPCErrorResponse(httpResponse, contentType: contentType) {
+                var buffer = Data()
+                for try await byte in stream {
+                    buffer.append(byte)
+                }
+                try Self.validateModernDirectResponse(buffer, expectedID: expectedResponseID)
+                messageContinuation.yield(buffer)
+                return
+            }
+
             try processHTTPResponse(httpResponse, contentType: contentType)
             guard case 200..<300 = httpResponse.statusCode else { return }
 
             if contentType.contains(ContentType.sse) {
                 logger.trace("Received SSE response, processing in streaming task")
-                let hadData = try await self.processSSE(stream)
+                let hadData = try await self.processSSE(
+                    stream,
+                    expectedResponseID: expectedResponseID
+                )
 
                 if !hadData {
                     logger.debug("POST SSE stream closed without data, triggering GET reconnection")
@@ -369,6 +459,7 @@ public actor HTTPClientTransport: Transport {
                 for try await byte in stream {
                     buffer.append(byte)
                 }
+                try Self.validateModernDirectResponse(buffer, expectedID: expectedResponseID)
                 logger.trace("Received JSON response", metadata: ["size": "\(buffer.count)"])
                 messageContinuation.yield(buffer)
             } else {
@@ -376,6 +467,66 @@ public actor HTTPClientTransport: Transport {
             }
         }
     #endif
+
+    private static func modernRequestID(from data: Data) throws -> ID? {
+        let value = try JSONDecoder().decode(Value.self, from: data)
+        guard case .object(let fields) = value,
+            fields["method"]?.stringValue != nil,
+            let rawID = fields["id"]
+        else {
+            return nil
+        }
+        switch rawID {
+        case .string(let id):
+            return .string(id)
+        case .int(let id):
+            return .number(id)
+        default:
+            throw ProtocolCoreError.malformedMessage(
+                "modern HTTP request id must be a string or integer"
+            )
+        }
+    }
+
+    private static func validateModernDirectResponse(_ data: Data, expectedID: ID?) throws {
+        guard let expectedID else { return }
+        let response = try MessageCodec(era: .modern).decode(AnyResponse.self, from: data)
+        guard response.id == expectedID else {
+            throw ProtocolCoreError.malformedMessage(
+                "HTTP response id does not match request"
+            )
+        }
+    }
+
+    private static func validateModernExchangeMessage(_ data: Data, expectedID: ID?) throws {
+        guard let expectedID else { return }
+        let codec = MessageCodec(era: .modern)
+        let value = try codec.decode(Value.self, from: data)
+        guard case .object(let fields) = value else {
+            throw ProtocolCoreError.malformedMessage("HTTP exchange message must be an object")
+        }
+        if fields["result"] != nil || fields["error"] != nil {
+            let response = try codec.decode(AnyResponse.self, from: data)
+            guard response.id == expectedID else {
+                throw ProtocolCoreError.malformedMessage(
+                    "HTTP response id does not match request"
+                )
+            }
+        } else if fields["method"] == nil {
+            throw ProtocolCoreError.malformedMessage(
+                "HTTP exchange message has no method, result, or error"
+            )
+        }
+    }
+
+    private func isModernJSONRPCErrorResponse(
+        _ response: HTTPURLResponse,
+        contentType: String
+    ) -> Bool {
+        protocolVersion == Version.modern
+            && (response.statusCode == 400 || response.statusCode == 404)
+            && contentType.contains(ContentType.json)
+    }
 
     private func processHTTPResponse(_ response: HTTPURLResponse, contentType: String) throws {
         switch response.statusCode {
@@ -642,7 +793,10 @@ public actor HTTPClientTransport: Transport {
         }
 
         @discardableResult
-        private func processSSE(_ stream: URLSession.AsyncBytes) async throws -> Bool {
+        private func processSSE(
+            _ stream: URLSession.AsyncBytes,
+            expectedResponseID: ID? = nil
+        ) async throws -> Bool {
             logger.debug("📥 Starting SSE event processing")
             var eventCount = 0
             var hadDataEvent = false
@@ -674,6 +828,10 @@ public actor HTTPClientTransport: Transport {
                 }
 
                 if !event.data.isEmpty, let data = event.data.data(using: .utf8) {
+                    try Self.validateModernExchangeMessage(
+                        data,
+                        expectedID: expectedResponseID
+                    )
                     hadDataEvent = true
                     messageContinuation.yield(data)
                 }

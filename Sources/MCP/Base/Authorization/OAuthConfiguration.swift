@@ -196,7 +196,7 @@ public struct OAuthConfiguration: Sendable {
         /// Maximum number of authentication retries for a single MCP request.
         public let maxAuthorizationAttempts: Int
 
-        /// Maximum number of scope step-up attempts for a resource and operation.
+        /// Maximum number of scope step-up attempts for one outgoing HTTP logical request.
         public let maxScopeUpgradeAttempts: Int
 
         /// Creates a retry policy.
@@ -206,7 +206,7 @@ public struct OAuthConfiguration: Sendable {
         ///
         /// - Parameters:
         ///   - maxAuthorizationAttempts: Maximum authorization retries per request. Defaults to 3.
-        ///   - maxScopeUpgradeAttempts: Maximum scope step-up attempts per resource+operation. Defaults to 2.
+        ///   - maxScopeUpgradeAttempts: Maximum scope step-up attempts per outgoing HTTP logical request. Defaults to 2.
         public init(
             maxAuthorizationAttempts: Int = 3,
             maxScopeUpgradeAttempts: Int = 2
