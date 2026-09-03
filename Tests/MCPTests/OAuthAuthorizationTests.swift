@@ -1,6 +1,10 @@
 import Foundation
 import Testing
 
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+
 #if canImport(CryptoKit)
 import CryptoKit
 #endif
