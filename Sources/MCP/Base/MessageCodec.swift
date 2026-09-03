@@ -32,6 +32,10 @@ struct MessageCodec: Sendable {
         } else {
             result = raw
         }
+        return try decodeResultEnvelope(from: result)
+    }
+
+    func decodeResultEnvelope(from result: Value) throws -> ResultEnvelope {
         let normalizedResult = materializeDefaultResultType(result)
         if era.isModern {
             try validateModernResult(normalizedResult)

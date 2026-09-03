@@ -467,6 +467,39 @@ struct MCP26ServerTests {
         )
         #expect(try modernServerError(removed).code == MCPError.methodNotFound(nil).code)
 
+        let missingMetadataID = ID.string("missing-metadata")
+        let missingMetadataBody = try JSONEncoder().encode(
+            Request<AnyMethod>(
+                id: missingMetadataID,
+                method: CallTool.name,
+                params: .object(["name": .string("echo"), "arguments": .object([:])])
+            )
+        )
+        let missingMetadata = await transport.handleRequest(
+            HTTPRequest(
+                method: "POST",
+                headers: [
+                    HTTPHeaderName.contentType: ContentType.json,
+                    HTTPHeaderName.accept: "application/json, text/event-stream",
+                    HTTPHeaderName.protocolVersion: Version.modern,
+                    HTTPHeaderName.method: CallTool.name,
+                    HTTPHeaderName.name: "echo",
+                ],
+                body: missingMetadataBody,
+                path: "/mcp"
+            )
+        )
+        let missingMetadataResponse = try JSONDecoder().decode(
+            AnyResponse.self,
+            from: try #require(missingMetadata.bodyData)
+        )
+        #expect(missingMetadata.statusCode == 400)
+        #expect(missingMetadataResponse.id == missingMetadataID)
+        guard case .failure(let missingMetadataError) = missingMetadataResponse.result else {
+            throw ModernServerTestError.unexpectedResponse
+        }
+        #expect(missingMetadataError.code == MCPError.invalidParams(nil).code)
+
         let invalidLogLevel = await transport.handleRequest(
             try modernServerRequest(
                 id: "invalid-log",

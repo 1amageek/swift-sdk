@@ -105,8 +105,8 @@ extension Server {
         _ request: AnyRequest,
         as type: M.Type
     ) throws -> Request<M> {
-        let data = try JSONEncoder().encode(request)
-        return try JSONDecoder().decode(Request<M>.self, from: data)
+        let codec = MessageCodec(era: .modern)
+        return try codec.decode(Request<M>.self, from: codec.encode(request))
     }
 
     private static func erase<Complete: Codable & Sendable>(
@@ -155,23 +155,35 @@ extension Server {
 
                 var requestID: ID?
                 do {
-                    let decoder = JSONDecoder()
-                    if let batch = try? decoder.decode(Server.Batch.self, from: data) {
+                    let codec = MessageCodec(era: .legacy)
+                    if let batch = try? codec.decode(Server.Batch.self, from: data) {
                         try await handleBatch(batch)
-                    } else if let response = try? decoder.decode(AnyResponse.self, from: data) {
+                    } else if let response = try? codec.decode(AnyResponse.self, from: data) {
                         await handleResponse(response)
-                    } else if let request = try? decoder.decode(AnyRequest.self, from: data) {
+                    } else if let request = try? codec.decode(AnyRequest.self, from: data) {
                         if isModernRequest(request) {
-                            enqueueModernRequest(request, exchangeID: nil, httpContext: nil)
+                            let modernRequest = try MessageCodec(era: .modern).decode(
+                                AnyRequest.self,
+                                from: data
+                            )
+                            enqueueModernRequest(
+                                modernRequest,
+                                exchangeID: nil,
+                                httpContext: nil
+                            )
                         } else {
                             Task {
                                 _ = try? await self.handleRequest(request, sendResponse: true)
                             }
                         }
-                    } else if let message = try? decoder.decode(AnyMessage.self, from: data) {
+                    } else if let message = try? codec.decode(AnyMessage.self, from: data) {
                         if isModernNotification(message) {
+                            let modernMessage = try MessageCodec(era: .modern).decode(
+                                AnyMessage.self,
+                                from: data
+                            )
                             await processModernNotification(
-                                message,
+                                modernMessage,
                                 exchangeID: nil,
                                 httpContext: nil
                             )
@@ -219,19 +231,70 @@ extension Server {
                 switch envelope {
                 case .request(let exchangeID, let body, _, let httpContext, let era):
                     guard era == .modern else { continue }
-                    let decoder = JSONDecoder()
-                    if let request = try? decoder.decode(AnyRequest.self, from: body) {
-                        enqueueModernRequest(
-                            request,
-                            exchangeID: exchangeID,
-                            httpContext: httpContext
-                        )
-                    } else if let message = try? decoder.decode(AnyMessage.self, from: body) {
-                        await processModernNotification(
-                            message,
-                            exchangeID: exchangeID,
-                            httpContext: httpContext
-                        )
+                    let structuralCodec = MessageCodec(era: .legacy)
+                    let modernCodec = MessageCodec(era: .modern)
+                    if let request = try? structuralCodec.decode(AnyRequest.self, from: body) {
+                        do {
+                            let validatedRequest = try modernCodec.decode(
+                                AnyRequest.self,
+                                from: body
+                            )
+                            enqueueModernRequest(
+                                validatedRequest,
+                                exchangeID: exchangeID,
+                                httpContext: httpContext
+                            )
+                        } catch {
+                            do {
+                                try await transport.send(
+                                    .data(
+                                        exchangeID: exchangeID,
+                                        data: try encodeModernError(
+                                            id: request.id,
+                                            error: modernMCPError(error)
+                                        ),
+                                        terminal: true
+                                    )
+                                )
+                            } catch {
+                                await logger?.debug(
+                                    "Invalid modern request could not be delivered",
+                                    metadata: [
+                                        "exchangeID": "\(exchangeID)",
+                                        "error": "\(error)",
+                                    ]
+                                )
+                            }
+                        }
+                    } else if (try? structuralCodec.decode(AnyMessage.self, from: body)) != nil {
+                        do {
+                            let validatedMessage = try modernCodec.decode(
+                                AnyMessage.self,
+                                from: body
+                            )
+                            await processModernNotification(
+                                validatedMessage,
+                                exchangeID: exchangeID,
+                                httpContext: httpContext
+                            )
+                        } catch {
+                            do {
+                                try await transport.send(
+                                    .failure(
+                                        exchangeID: exchangeID,
+                                        error: modernMCPError(error)
+                                    )
+                                )
+                            } catch {
+                                await logger?.debug(
+                                    "Invalid modern notification could not be delivered",
+                                    metadata: [
+                                        "exchangeID": "\(exchangeID)",
+                                        "error": "\(error)",
+                                    ]
+                                )
+                            }
+                        }
                     } else {
                         let error = MCPError.invalidRequest("Invalid modern JSON-RPC request")
                         do {
@@ -513,10 +576,10 @@ extension Server {
 
     private func handleModernNotification(_ message: AnyMessage) async throws {
         if message.method == CancelledNotification.name {
-            let data = try JSONEncoder().encode(message)
-            let cancellation = try JSONDecoder().decode(
+            let codec = MessageCodec(era: .modern)
+            let cancellation = try codec.decode(
                 Message<CancelledNotification>.self,
-                from: data
+                from: codec.encode(message)
             )
             if let id = cancellation.params.requestId {
                 cancelModernSubscription(for: .stream(id))
@@ -568,7 +631,7 @@ extension Server {
             .init(subscriptionID: request.id, notifications: accepted)
         )
         try await sendModern(
-            data: try JSONEncoder().encode(acknowledgement),
+            data: try MessageCodec(era: .modern).encode(acknowledgement),
             exchangeID: context.exchangeID,
             terminal: false
         )
@@ -631,7 +694,7 @@ extension Server {
                     result: result
                 )
                 try await sendModern(
-                    data: try JSONEncoder().encode(response),
+                    data: try MessageCodec(era: .modern).encode(response),
                     exchangeID: subscription.exchangeID,
                     terminal: true
                 )
@@ -649,11 +712,13 @@ extension Server {
         method: String,
         data: Data
     ) async throws -> Bool {
+        let codec = MessageCodec(era: .modern)
         if let context = Self.currentHandlerContext, context.era == .modern {
             switch method {
             case ProgressNotification.name:
+                let message = try codec.decode(AnyMessage.self, from: data)
                 try await sendModern(
-                    data: data,
+                    data: try codec.encode(message),
                     exchangeID: context.exchangeID,
                     terminal: false
                 )
@@ -664,7 +729,7 @@ extension Server {
                 else {
                     return true
                 }
-                let message = try JSONDecoder().decode(
+                let message = try codec.decode(
                     Message<LogMessageNotification>.self,
                     from: data
                 )
@@ -672,7 +737,7 @@ extension Server {
                     return true
                 }
                 try await sendModern(
-                    data: data,
+                    data: try codec.encode(message),
                     exchangeID: context.exchangeID,
                     terminal: false
                 )
@@ -691,7 +756,8 @@ extension Server {
         for subscription in modernSubscriptions.values where try Self.subscription(
             subscription,
             accepts: method,
-            data: data
+            data: data,
+            codec: codec
         ) {
             subscriptions.append(subscription)
         }
@@ -699,7 +765,8 @@ extension Server {
             try await sendModern(
                 data: try Self.notificationData(
                     data,
-                    subscriptionID: subscription.id
+                    subscriptionID: subscription.id,
+                    codec: codec
                 ),
                 exchangeID: subscription.exchangeID,
                 terminal: false
@@ -726,7 +793,8 @@ extension Server {
     private static func subscription(
         _ subscription: ModernSubscription,
         accepts method: String,
-        data: Data
+        data: Data,
+        codec: MessageCodec
     ) throws -> Bool {
         switch method {
         case ToolListChangedNotification.name:
@@ -736,7 +804,7 @@ extension Server {
         case ResourceListChangedNotification.name:
             return subscription.filter.resourcesListChanged == true
         case ResourceUpdatedNotification.name:
-            let message = try JSONDecoder().decode(
+            let message = try codec.decode(
                 Message<ResourceUpdatedNotification>.self,
                 from: data
             )
@@ -748,15 +816,16 @@ extension Server {
 
     private static func notificationData(
         _ data: Data,
-        subscriptionID: ID
+        subscriptionID: ID,
+        codec: MessageCodec
     ) throws -> Data {
-        var fields = try JSONDecoder().decode([String: Value].self, from: data)
+        var fields = try codec.decode([String: Value].self, from: data)
         var parameters = fields["params"]?.objectValue ?? [:]
         var metadata = parameters["_meta"]?.objectValue ?? [:]
         metadata[NotificationMetadata.subscriptionIDKey] = try Value(subscriptionID)
         parameters["_meta"] = .object(metadata)
         fields["params"] = .object(parameters)
-        return try JSONEncoder().encode(fields)
+        return try codec.encode(fields)
     }
 
     private static func logLevelRank(_ level: LogLevel) -> Int {
@@ -1073,52 +1142,48 @@ extension Server {
         id: ID,
         payload: ModernResultPayload
     ) throws -> Data {
+        let codec = MessageCodec(era: .modern)
         let resultValue: Value
         switch payload {
         case .complete(let value, let metadata, let cacheHint):
-            resultValue = try completeValue(
-                value,
-                metadata: metadata,
-                cacheHint: cacheHint
+            let existing = try codec.decodeResultEnvelope(from: value)
+            resultValue = try Value(
+                ResultEnvelope(
+                    metadata: mergedResultMetadata(
+                        existing: existing.metadata,
+                        additional: metadata
+                    ),
+                    cacheHint: cacheHint ?? existing.cacheHint,
+                    fields: existing.fields
+                )
             )
         case .inputRequired(let input):
-            resultValue = try inputRequiredValue(input)
+            resultValue = try Value(
+                InputRequiredResult(
+                    inputRequests: input.inputRequests,
+                    requestState: input.requestState,
+                    metadata: mergedResultMetadata(existing: input.metadata, additional: nil),
+                    additionalFields: input.additionalFields
+                )
+            )
         }
-        return try JSONEncoder().encode(
+        return try codec.encode(
             AnyResponse(id: id, result: .success(resultValue))
         )
     }
 
-    private func completeValue(
-        _ value: Value,
-        metadata: ResultMetadata?,
-        cacheHint: CacheHint?
-    ) throws -> Value {
-        guard case .object(var fields) = value else {
-            throw ProtocolCoreError.invalidResultInput
+    private func mergedResultMetadata(
+        existing: ResultMetadata?,
+        additional: ResultMetadata?
+    ) -> ResultMetadata {
+        var fields = existing?.additionalFields ?? [:]
+        if let additional {
+            fields.merge(additional.additionalFields) { _, new in new }
         }
-        var metadataFields = fields["_meta"]?.objectValue ?? [:]
-        if let metadata {
-            metadataFields.merge(metadata.additionalFields) { _, new in new }
-        }
-        metadataFields[ResultMetadata.serverInfoKey] = try Value(serverImplementationInfo())
-        fields["_meta"] = .object(metadataFields)
-        fields["resultType"] = .string(ResultType.complete.rawValue)
-        if let cacheHint {
-            fields["cacheScope"] = .string(cacheHint.scope.rawValue)
-            fields["ttlMs"] = .int(cacheHint.ttlMs)
-        }
-        return .object(fields)
-    }
-
-    private func inputRequiredValue(_ value: InputRequiredResult) throws -> Value {
-        guard case .object(var fields) = try Value(value) else {
-            throw ProtocolCoreError.invalidResultInput
-        }
-        var metadataFields = fields["_meta"]?.objectValue ?? [:]
-        metadataFields[ResultMetadata.serverInfoKey] = try Value(serverImplementationInfo())
-        fields["_meta"] = .object(metadataFields)
-        return .object(fields)
+        return ResultMetadata(
+            serverInfo: serverImplementationInfo(),
+            additionalFields: fields
+        )
     }
 
     private func serverImplementationInfo() -> ImplementationInfo {
@@ -1133,7 +1198,7 @@ extension Server {
     }
 
     private func encodeModernError(id: ID, error: MCPError) throws -> Data {
-        try JSONEncoder().encode(AnyResponse(id: id, error: error))
+        try MessageCodec(era: .modern).encode(AnyResponse(id: id, error: error))
     }
 
     private func sendModern(

@@ -53,8 +53,12 @@ struct ProtocolCoreTests {
         let data = try JSONEncoder().encode(response)
 
         let modern = try MessageCodec(era: .modern).decodeResultEnvelope(from: data)
+        let modernValue = try MessageCodec(era: .modern).decodeResultEnvelope(
+            from: .object(["value": .string("ok")])
+        )
         let legacy = try MessageCodec(era: .legacy).decodeResultEnvelope(from: data)
         #expect(modern.resultType == .complete)
+        #expect(modernValue == modern)
         #expect(legacy.resultType == .complete)
     }
 

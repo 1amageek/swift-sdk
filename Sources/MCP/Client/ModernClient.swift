@@ -803,19 +803,22 @@ extension Client {
     }
 
     private func processIncomingData(_ data: Data) async -> Bool {
-        if let batch = try? decoder.decode([AnyResponse].self, from: data) {
+        let era: ProtocolEra =
+            connectionInfo?.era == .modern || negotiationProbeID != nil ? .modern : .legacy
+        let codec = MessageCodec(era: era)
+        if let batch = try? codec.decode([AnyResponse].self, from: data) {
             await handleBatchResponse(batch)
             return true
         }
-        if let response = try? decoder.decode(AnyResponse.self, from: data) {
+        if let response = try? codec.decode(AnyResponse.self, from: data) {
             await handleResponse(response)
             return true
         }
-        if let request = try? decoder.decode(AnyRequest.self, from: data) {
+        if let request = try? codec.decode(AnyRequest.self, from: data) {
             await handleIncomingRequest(request)
             return true
         }
-        if let message = try? decoder.decode(AnyMessage.self, from: data) {
+        if let message = try? codec.decode(AnyMessage.self, from: data) {
             await handleMessage(message)
             return true
         }
@@ -886,7 +889,7 @@ extension Client {
     }
 
     func decodeModernEnvelope(_ value: Value) throws -> ResultEnvelope {
-        try decode(ResultEnvelope.self, from: value)
+        try MessageCodec(era: .modern).decodeResultEnvelope(from: value)
     }
 
     func decode<T: Decodable>(_ type: T.Type, from value: Value) throws -> T {
