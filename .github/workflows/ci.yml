@@ -14,8 +14,9 @@ jobs:
   test:
     timeout-minutes: 10
     strategy:
+      fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        os: [macos-15, ubuntu-latest]
         swift-version:
           - 6.1.0
 
@@ -36,11 +37,9 @@ jobs:
         uses: vapor/swiftly-action@v0.2
         with:
           toolchain: ${{ matrix.swift-version }}
-      - name: Setup Swift on macOS
-        if: matrix.os == 'macos-latest'
-        uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: ${{ matrix.swift-version }}
+      - name: Select Xcode 16.4
+        if: runner.os == 'macOS'
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
 
       - name: Build
         run: swift build -v
@@ -50,16 +49,14 @@ jobs:
 
   conformance:
     timeout-minutes: 10
-    runs-on: macos-latest
+    runs-on: macos-15
     name: MCP Conformance Tests
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Swift
-        uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: 6.1.0
+      - name: Select Xcode 16.4
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
 
       - uses: actions/setup-node@v4
         with:
@@ -78,13 +75,12 @@ jobs:
 
   documentation:
     name: Documentation
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: "6.1.0"
+      - name: Select Xcode 16.4
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
       - name: Build Documentation
         run: swift package generate-documentation --target MCP --warnings-as-errors
 

@@ -64,7 +64,7 @@ the conformance suite's report-only and pending extensions.
 
 ## Requirements
 
-- Swift 6.0+ (Xcode 16+)
+- Swift 6.1+ (Xcode 16.4+)
 
 See the [Platform Availability](#platform-availability) section below
 for platform-specific requirements.
