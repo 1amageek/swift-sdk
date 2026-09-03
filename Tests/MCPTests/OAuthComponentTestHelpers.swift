@@ -35,6 +35,7 @@
 
     final class IsolatedMockURLProtocol: URLProtocol, @unchecked Sendable {
         static let sessionKeyHeader = "X-Mock-Key"
+        private let loadingState = URLProtocolLoadingState()
 
         static func makeSession(key: String) -> URLSession {
             let config = URLSessionConfiguration.ephemeral
@@ -62,15 +63,19 @@
             Task {
                 do {
                     let (response, data) = try await self.executeHandler(for: request)
+                    guard loadingState.beginCompletion() else { return }
                     client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
                     client?.urlProtocol(self, didLoad: data)
                     client?.urlProtocolDidFinishLoading(self)
                 } catch {
+                    guard loadingState.beginCompletion() else { return }
                     client?.urlProtocol(self, didFailWithError: error)
                 }
             }
         }
-        override func stopLoading() {}
+        override func stopLoading() {
+            loadingState.stop()
+        }
     }
 
     // MARK: - Per-test session factory
