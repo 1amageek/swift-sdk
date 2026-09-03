@@ -150,6 +150,39 @@ import Testing
         }
     }
 
+    private enum HTTPResponseCorrelationEcho: MCP.Method {
+        static let name = "test/http-response-correlation"
+
+        struct Parameters: Hashable, Codable, Sendable {
+            let value: String
+        }
+
+        struct Result: Hashable, Codable, Sendable {
+            let value: String
+        }
+    }
+
+    private actor SwappedModernHTTPResponseCoordinator {
+        private struct Waiting: Sendable {
+            let id: ID
+            let value: String
+            let continuation: CheckedContinuation<(ID, String), Never>
+        }
+
+        private var waiting: Waiting?
+
+        func response(for id: ID, value: String) async -> (ID, String) {
+            if let waiting {
+                self.waiting = nil
+                waiting.continuation.resume(returning: (id, waiting.value))
+                return (waiting.id, value)
+            }
+            return await withCheckedContinuation { continuation in
+                waiting = Waiting(id: id, value: value, continuation: continuation)
+            }
+        }
+    }
+
     // MARK: -
 
     @Suite("HTTP Client Transport Tests", .serialized)
@@ -2500,6 +2533,108 @@ import Testing
 
                 try await transport.send(messageData)
                 await transport.disconnect()
+            }
+
+            @Test(
+                "Modern HTTP responses cannot complete a different concurrent request",
+                .httpClientTransportSetup,
+                .timeLimit(.minutes(1))
+            )
+            func testModernHTTPResponseCorrelation() async throws {
+                let configuration = URLSessionConfiguration.ephemeral
+                configuration.protocolClasses = [MockURLProtocol.self]
+                let coordinator = SwappedModernHTTPResponseCoordinator()
+                let transport = HTTPClientTransport(
+                    endpoint: testEndpoint,
+                    configuration: configuration,
+                    streaming: false,
+                    protocolVersion: Version.modern,
+                    logger: nil
+                )
+                let client = Client(name: "CorrelationClient", version: "1")
+
+                await MockURLProtocol.requestHandlerStorage.setHandler {
+                    [testEndpoint, coordinator] request in
+                    guard let data = request.readBody() else {
+                        throw ProtocolCoreError.malformedMessage("request body is missing")
+                    }
+                    let message = try MessageCodec(era: .modern).decode(
+                        AnyRequest.self,
+                        from: data
+                    )
+                    let responseData: Data
+                    if message.method == ServerDiscover.name {
+                        let result = DiscoverResult(
+                            supportedVersions: [Version.modern],
+                            cacheHint: try CacheHint(scope: .private, ttlMs: 0)
+                        )
+                        responseData = try MessageCodec(era: .modern).encode(
+                            ServerDiscover.response(id: message.id, result: result)
+                        )
+                    } else {
+                        guard message.method == HTTPResponseCorrelationEcho.name,
+                            case .object(let fields) = message.params,
+                            let value = fields["value"]?.stringValue
+                        else {
+                            throw ProtocolCoreError.malformedMessage("unexpected request")
+                        }
+                        let (responseID, responseValue) = await coordinator.response(
+                            for: message.id,
+                            value: value
+                        )
+                        responseData = try MessageCodec(era: .modern).encode(
+                            HTTPResponseCorrelationEcho.response(
+                                id: responseID,
+                                result: .init(value: "response-for-\(responseValue)")
+                            )
+                        )
+                    }
+                    let response = HTTPURLResponse(
+                        url: testEndpoint,
+                        statusCode: 200,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: ["Content-Type": "application/json"]
+                    )!
+                    return (response, responseData)
+                }
+
+                _ = try await client.connect(
+                    transport: transport,
+                    preference: .modernOnly,
+                    delivery: .http
+                )
+                let first = Task {
+                    do {
+                        _ = try await client.sendModern(
+                            HTTPResponseCorrelationEcho.request(.init(value: "first"))
+                        )
+                        return false
+                    } catch let error as ProtocolCoreError {
+                        return error == .malformedMessage(
+                            "HTTP response id does not match request"
+                        )
+                    } catch {
+                        return false
+                    }
+                }
+                let second = Task {
+                    do {
+                        _ = try await client.sendModern(
+                            HTTPResponseCorrelationEcho.request(.init(value: "second"))
+                        )
+                        return false
+                    } catch let error as ProtocolCoreError {
+                        return error == .malformedMessage(
+                            "HTTP response id does not match request"
+                        )
+                    } catch {
+                        return false
+                    }
+                }
+
+                #expect(await first.value)
+                #expect(await second.value)
+                await client.disconnect()
             }
         #endif  // !canImport(FoundationNetworking)
     }

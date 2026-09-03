@@ -30,6 +30,9 @@ dispatch.
 For outbound modern HTTP, Transport accepts Client-derived headers through a
 Client-only package capability and applies them to one request. It never
 derives or interprets their method or schema meaning.
+Before forwarding inbound data, it validates every modern JSON-RPC response
+against the ID of the POST that produced it. A malformed or mismatched response
+fails only that POST and cannot complete or cancel another pending request.
 
 ## Related Designs
 
@@ -101,7 +104,7 @@ use `Transport.send(Data)`.
 | Contract | Guarantee |
 | --- | --- |
 | Public raw transport | `Transport: Actor` retains `logger`, `connect()`, `disconnect()`, `send(Data)`, and `receive() -> AsyncThrowingStream<Data, Error>`. Existing custom transports continue to compile and behave as raw byte channels. |
-| Client HTTP request capability | The package-internal HTTP capability applies Client-derived headers to one request and updates the selected protocol-version header. It owns HTTP construction/auth/retry/SSE only and never inspects method or schema meaning. |
+| Client HTTP request capability | The package-internal HTTP capability applies Client-derived headers to one request, updates the selected protocol-version header, and validates direct or SSE response IDs against that request before forwarding. It owns HTTP construction/auth/retry/SSE only and never inspects method or schema meaning. |
 | Authorization retry ownership | Each HTTP logical request owns finite authorization and scope-upgrade counters. The counters are released by stack lifetime on success, failure, or cancellation and never persist in the authorizer or across later requests. |
 | Modern HTTP admission | Each request is a new POST. The transport validates HTTP/body syntax, safely normalizes standard header names and OWS, validates the protocol-version header and its exact agreement with request `_meta` before Base decoding, preserves the request ID and structured error data on admission failure, validates Origin, mints an `ExchangeID`, and maps typed boundary failures to HTTP status. Server owns method/name header applicability, tool-schema custom-header, and method-semantic validation. |
 | Modern HTTP lifecycle | No modern session ID, GET subscription endpoint, `Last-Event-ID`, replay, or DELETE lifecycle is used. A per-request JSON or SSE result ends with that exchange. |
@@ -173,6 +176,9 @@ are not silently delivered to another exchange.
   modern HTTP `404` with `-32601`; Transport does not decide method semantics.
 - A cancelled or disconnected exchange resumes its waiter with a typed failure,
   removes its context, and ignores a late response.
+- A malformed modern response or an ID that differs from the originating POST
+  fails that request's delivery task before global message delivery. Other
+  in-flight requests remain pending and cannot consume that response.
 - Modern SSE is per request and non-resumable. Legacy resumability remains only
   on the legacy branch. Non-terminal producers apply bounded backpressure;
   terminal delivery never makes shutdown wait for an inactive consumer.
