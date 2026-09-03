@@ -27,6 +27,9 @@ It does not inspect tool schemas, validate schema-derived `Mcp-Param-*` values,
 or decide whether a method is known. Server performs those semantic checks with
 the current request/auth context and Base's `ToolHeaderResolver` before handler
 dispatch.
+For outbound modern HTTP, Transport accepts Client-derived headers through a
+Client-only package capability and applies them to one request. It never
+derives or interprets their method or schema meaning.
 
 ## Related Designs
 
@@ -85,11 +88,20 @@ Modern stdio may use the raw live channel because it has no HTTP exchange
 identity; it still follows the Client negotiation contract and one-connection
 fallback rule.
 
+### Package-internal client HTTP request capability
+
+`HTTPRequestSendingTransport` is the outbound seam for Client-owned modern
+headers. It adds `send(Data, headers:)` and negotiated-version update without
+changing public `Transport`. Client selects it only for explicit HTTP delivery;
+a nonconforming transport fails before send. Byte-stream delivery continues to
+use `Transport.send(Data)`.
+
 ## Contracts and Invariants
 
 | Contract | Guarantee |
 | --- | --- |
 | Public raw transport | `Transport: Actor` retains `logger`, `connect()`, `disconnect()`, `send(Data)`, and `receive() -> AsyncThrowingStream<Data, Error>`. Existing custom transports continue to compile and behave as raw byte channels. |
+| Client HTTP request capability | The package-internal HTTP capability applies Client-derived headers to one request and updates the selected protocol-version header. It owns HTTP construction/auth/retry/SSE only and never inspects method or schema meaning. |
 | Modern HTTP admission | Each request is a new POST. The transport validates HTTP/body syntax, safely normalizes standard header names and OWS, validates the modern protocol version and Origin before delivery, mints an `ExchangeID`, and maps typed boundary failures to HTTP status. Server owns header/body meaning, header applicability, tool-schema custom-header, and method-semantic validation. |
 | Modern HTTP lifecycle | No modern session ID, GET subscription endpoint, `Last-Event-ID`, replay, or DELETE lifecycle is used. A per-request JSON or SSE result ends with that exchange. |
 | Legacy HTTP compatibility | Existing stateful initialize/session/GET-SSE/DELETE/replay paths remain available for legacy peers and are not selected for modern requests. |

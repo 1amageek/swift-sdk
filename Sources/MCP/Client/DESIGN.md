@@ -15,7 +15,9 @@ Parent: [MCP module](../DESIGN.md).
 Client creates protocol requests, registers one pending owner per request ID,
 drives the response loop, and exposes typed results and failures. It selects
 the era through an explicit connection API and returns `ConnectionInfo` for
-modern/dual-era use.
+modern/dual-era use. That API also receives an explicit byte-stream or HTTP
+delivery kind because the unchanged public `Transport` contract cannot infer
+the external adapter's wire semantics.
 
 Client does not encode wire details itself, inspect a concrete transport type,
 perform HTTP header parsing, resolve schemas over the network, own server
@@ -44,6 +46,7 @@ flowchart TD
     Pending[Pending request ownership]
     MRTR[Bounded MRTR loop]
     Sub[Subscription demultiplexing]
+    HTTPRequest[Package-internal HTTP request capability]
 
     App --> Client
     Client --> Core
@@ -51,6 +54,8 @@ flowchart TD
     Client --> Pending
     Client --> MRTR
     Client --> Sub
+    Client --> HTTPRequest
+    HTTPRequest --> Transport
 ```
 
 There is one orchestration actor, not a coordinator/factory layer. Core and
@@ -63,10 +68,14 @@ their internal state to callers.
 | --- | --- |
 | Legacy entry point | For the supported legacy family (`2024-11-05` through `2025-11-25`), `connect(transport:) async throws -> Initialize.Result` keeps its existing initialize/initialized behavior and accepts existing raw `Transport` implementations. |
 | Modern entry point | An explicit modern/dual-era operation returns `ConnectionInfo`; it reports negotiated era, supported capabilities, and server information without exposing a transport-specific type. |
+| Delivery selection | `.byteStream` uses the unchanged raw transport. `.http` requires the package-internal HTTP request capability and fails before sending when the transport does not provide it; there is no silent raw fallback. |
+| Connection preference | `.modernOnly` accepts only successful modern discovery. `.modernThenLegacy` falls back on the same byte-stream connection only after a non-modern JSON-RPC error or discovery timeout; recognized modern errors remain modern failures, and malformed/closed streams never fall back. |
+| Connection ownership | Client owns at most one active transport/message-loop pair. A second `connect` before `disconnect` fails without connecting or replacing the proposed transport. |
+| Discovery timeout | `Client.Configuration.discoveryProbeTimeout` is finite and positive, defaults to the existing 10-second initialization wait baseline, and bounds only the discovery classification attempt. |
 | Negotiation | Stdio probes modern discovery and recognized modern errors on one live connection before legacy fallback; HTTP pins the origin's selected era for the configured origin lifetime, ending only when the origin configuration changes or an explicit disconnect/other defined terminal condition occurs. Unsupported versions and closed/malformed streams fail explicitly. |
 | Pending requests | Each attempt registers a fresh JSON-RPC ID before send; response, send failure, local cancellation, remote cancellation, disconnect, and malformed stream remove/resume the pending owner exactly once. |
 | Metadata | Every modern request carries request-scoped `_meta` with required protocol/client capability fields; result type and cache hints are decoded and exposed as data, with no cache store. |
-| Tool headers | Client asks the Base resolver for headers from the current tool schema, omits null/missing values, rejects invalid tools, and retries a `-32020` mismatch at most once with a fresh request ID. |
+| Tool headers | For HTTP `tools/call`, Client asks the Base resolver for headers from the current tool schema, omits null/missing values, rejects invalid tools, and retries a `-32020` mismatch at most once with a fresh request ID. Byte-stream delivery does not perform HTTP-only schema discovery. |
 | MRTR | Client accepts only the supported input requests for `tools/call`, `prompts/get`, and `resources/read`, routes each key to the application handler, preserves the opaque untrusted `requestState` exactly, and owns the `maxRounds = 10` loop. Integrity policy is application/conformance policy, not Client state validation. |
 | Subscriptions | Client demultiplexes acknowledged modern subscription streams, requires acknowledgement ordering, and cancels/cleans each stream without treating a subscription as a connection session. |
 | Application ownership | User input, approval, persistence, and task scheduling remain outside Client. |
@@ -139,10 +148,13 @@ sequenceDiagram
 
 | State | Owner | Lifetime |
 | --- | --- | --- |
-| active raw connection | Client actor reference + concrete Transport actor | explicit connect through disconnect |
+| active raw connection | Client actor reference + abstract Transport actor | explicit connect through disconnect |
+| selected delivery kind | Client actor | explicit modern/dual connect through disconnect; it determines raw versus HTTP request delivery without identifying a concrete transport |
 | negotiated `ConnectionInfo` | Client actor | configured origin lifetime, ending on origin configuration change or explicit disconnect/defined terminal condition; modern HTTP request metadata is not stored as session state |
+| discovery timer | current Client negotiation | discovery send through first classified response, timeout, cancellation, disconnect, or fallback; never retained afterward |
 | pending request table | Client actor | request registration through one terminal outcome |
-| tool header list | one modern call attempt | transient discovery operation; cursor pages stop at 64 |
+| outbound delivery task | Client actor request/subscription state | send start through response, send failure, local/remote cancellation, disconnect, malformed input, or subscription terminal outcome; local cancellation does not depend on peer cooperation |
+| tool header list | one modern HTTP call attempt | transient discovery operation; cursor pages stop at 64 |
 | MRTR request state | Client request orchestration | current call flow; exact opaque untrusted value is echoed and released on completion/failure |
 | subscription stream | Client actor | listen admission through cancellation/terminal result/disconnect |
 

@@ -33,7 +33,7 @@ the current package into feature packages merely to represent design layers.
 | [Base](Base/DESIGN.md) | child/depends on | state-free messages, models, and typed errors | no connection or I/O state |
 | [Transport](Base/Transports/DESIGN.md) | related design through Base | `Transport` actor and exchange mechanics | raw send/receive remains source-compatible |
 | [Authorization](Base/Authorization/DESIGN.md) | related design through Base | OAuth discovery and credential policy | HTTP transport invokes policy through its public contract |
-| [Client](Client/DESIGN.md) | direct child/owns orchestration | explicit modern connection and legacy `connect` | no concrete transport knowledge |
+| [Client](Client/DESIGN.md) | direct child/owns orchestration | explicit modern connection/delivery selection and legacy `connect` | no concrete transport knowledge |
 | [Server](Server/DESIGN.md) | direct child/owns orchestration | dispatch, discovery, and semantic request state | no HTTP header parsing |
 
 ## Architecture

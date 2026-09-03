@@ -88,7 +88,7 @@ workflow around a tool call.
 | --- | --- | --- |
 | Negotiation | existing initialize handshake on a live `Transport` | explicit modern/dual-era connection API returning `ConnectionInfo`; HTTP may discover per request |
 | Public entry point | `connect(transport:) async throws -> Initialize.Result` remains source- and behavior-compatible | new API is additive and explicit; it does not silently reinterpret legacy `connect` |
-| Public transport | `Transport.send(Data)` / `receive()` remain unchanged | the same raw transport can carry modern messages through an internal seam |
+| Public transport | `Transport.send(Data)` / `receive()` remain unchanged | explicit byte-stream delivery uses the raw path; explicit HTTP delivery uses a package-internal request-header capability without a concrete downcast |
 | HTTP lifecycle | existing session, GET/SSE, DELETE, and replay behavior remain available to legacy peers | every request is a new POST exchange; no session, GET stream, `Last-Event-ID`, or replay |
 | Stdio lifecycle | one live connection and initialize state | one live channel; modern discovery/fallback probing never opens a second connection |
 | Metadata | existing legacy fields and tolerant decoding | request `_meta` is request-scoped, result `resultType` is required, and cache hints are preserved as data |

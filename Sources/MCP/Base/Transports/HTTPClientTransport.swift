@@ -53,7 +53,7 @@ import Logging
 /// // The transport will automatically handle SSE events
 /// // and deliver them through the client's notification handlers
 /// ```
-public actor HTTPClientTransport: Transport {
+public actor HTTPClientTransport: Transport, HTTPRequestSendingTransport {
     /// The server endpoint URL to connect to
     public let endpoint: URL
     private let session: URLSession
@@ -187,7 +187,7 @@ public actor HTTPClientTransport: Transport {
 
         setupInitialSessionIDSignal()
 
-        if streaming {
+        if streaming, protocolVersion != Version.modern {
             streamingTask = Task { await startListeningForServerEvents() }
         }
 
@@ -216,10 +216,26 @@ public actor HTTPClientTransport: Transport {
     /// Updates the protocol version used for `MCP-Protocol-Version` headers on subsequent requests.
     public func updateNegotiatedProtocolVersion(_ version: String) {
         self.protocolVersion = version
+        guard isConnected, streaming else { return }
+        if version == Version.modern {
+            streamingTask?.cancel()
+            streamingTask = nil
+        } else if streamingTask == nil {
+            streamingTask = Task { await startListeningForServerEvents() }
+        }
     }
 
     /// Sends data through an HTTP POST request
     public func send(_ data: Data) async throws {
+        try await sendRequestData(data, headers: [:])
+    }
+
+    package func send(_ data: Data, headers: [String: String]) async throws {
+        try Self.validateAdditionalHeaders(headers)
+        try await sendRequestData(data, headers: headers)
+    }
+
+    private func sendRequestData(_ data: Data, headers: [String: String]) async throws {
         guard isConnected else {
             throw MCPError.internalError("Transport not connected")
         }
@@ -255,7 +271,7 @@ public actor HTTPClientTransport: Transport {
                 request.addValue(protocolVersion, forHTTPHeaderField: HTTPHeaderName.protocolVersion)
             }
 
-            if let sessionID = sessionID {
+            if protocolVersion != Version.modern, let sessionID = sessionID {
                 request.addValue(sessionID, forHTTPHeaderField: HTTPHeaderName.sessionID)
             }
 
@@ -264,6 +280,9 @@ public actor HTTPClientTransport: Transport {
             }
 
             request = requestModifier(request)
+            for (name, value) in headers {
+                request.setValue(value, forHTTPHeaderField: name)
+            }
 
             do {
                 #if os(Linux)
@@ -304,6 +323,28 @@ public actor HTTPClientTransport: Transport {
         }
     }
 
+    private static func validateAdditionalHeaders(_ headers: [String: String]) throws {
+        for (name, value) in headers {
+            guard !name.isEmpty, name.utf8.allSatisfy(isHeaderNameByte) else {
+                throw ProtocolCoreError.invalidHeaderValue("HTTP header name is invalid")
+            }
+            guard !value.utf8.contains(0x0A), !value.utf8.contains(0x0D) else {
+                throw ProtocolCoreError.invalidHeaderValue(
+                    "HTTP header value contains a line break")
+            }
+        }
+    }
+
+    private static func isHeaderNameByte(_ byte: UInt8) -> Bool {
+        switch byte {
+        case 0x21, 0x23...0x27, 0x2A, 0x2B, 0x2D, 0x2E, 0x30...0x39,
+            0x41...0x5A, 0x5E, 0x5F, 0x60, 0x61...0x7A, 0x7C, 0x7E:
+            return true
+        default:
+            return false
+        }
+    }
+
     #if os(Linux)
         private func processResponse(response: URLResponse, data: Data) async throws {
             guard let httpResponse = response as? HTTPURLResponse else {
@@ -319,6 +360,11 @@ public actor HTTPClientTransport: Transport {
                     triggerInitialSessionIDSignal()
                 }
                 logger.debug("Session ID received", metadata: ["sessionID": "\(newSessionID)"])
+            }
+
+            if isModernJSONRPCErrorResponse(httpResponse, contentType: contentType) {
+                messageContinuation.yield(data)
+                return
             }
 
             try processHTTPResponse(httpResponse, contentType: contentType)
@@ -353,6 +399,15 @@ public actor HTTPClientTransport: Transport {
                 logger.debug("Session ID received", metadata: ["sessionID": "\(newSessionID)"])
             }
 
+            if isModernJSONRPCErrorResponse(httpResponse, contentType: contentType) {
+                var buffer = Data()
+                for try await byte in stream {
+                    buffer.append(byte)
+                }
+                messageContinuation.yield(buffer)
+                return
+            }
+
             try processHTTPResponse(httpResponse, contentType: contentType)
             guard case 200..<300 = httpResponse.statusCode else { return }
 
@@ -376,6 +431,15 @@ public actor HTTPClientTransport: Transport {
             }
         }
     #endif
+
+    private func isModernJSONRPCErrorResponse(
+        _ response: HTTPURLResponse,
+        contentType: String
+    ) -> Bool {
+        protocolVersion == Version.modern
+            && (response.statusCode == 400 || response.statusCode == 404)
+            && contentType.contains(ContentType.json)
+    }
 
     private func processHTTPResponse(_ response: HTTPURLResponse, contentType: String) throws {
         switch response.statusCode {

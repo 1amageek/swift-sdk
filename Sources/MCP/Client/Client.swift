@@ -4,6 +4,7 @@ import struct Foundation.Data
 import struct Foundation.Date
 import class Foundation.JSONDecoder
 import class Foundation.JSONEncoder
+import typealias Foundation.TimeInterval
 
 /// Model Context Protocol client
 public actor Client {
@@ -25,8 +26,76 @@ public actor Client {
         /// servers, though this may lead to undefined behavior.
         public var strict: Bool
 
-        public init(strict: Bool = false) {
+        /// Maximum time allowed for classifying the modern discovery probe.
+        public var discoveryProbeTimeout: TimeInterval {
+            didSet { precondition(Self.isValidTimeout(discoveryProbeTimeout)) }
+        }
+
+        /// Maximum pages retained by one transient modern tool lookup.
+        public var maxToolListPages: Int {
+            didSet { precondition(maxToolListPages > 0) }
+        }
+
+        /// Maximum requests in one modern multi-round tool/resource/prompt call.
+        public var maxRounds: Int {
+            didSet { precondition(maxRounds > 0) }
+        }
+
+        public init(
+            strict: Bool = false,
+            discoveryProbeTimeout: TimeInterval = 10,
+            maxToolListPages: Int = 64,
+            maxRounds: Int = 10
+        ) {
+            precondition(Self.isValidTimeout(discoveryProbeTimeout))
+            precondition(maxToolListPages > 0)
+            precondition(maxRounds > 0)
             self.strict = strict
+            self.discoveryProbeTimeout = discoveryProbeTimeout
+            self.maxToolListPages = maxToolListPages
+            self.maxRounds = maxRounds
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case strict, discoveryProbeTimeout, maxToolListPages, maxRounds
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let strict = try container.decodeIfPresent(Bool.self, forKey: .strict) ?? false
+            let timeout =
+                try container.decodeIfPresent(
+                    TimeInterval.self,
+                    forKey: .discoveryProbeTimeout
+                ) ?? 10
+            let pages = try container.decodeIfPresent(Int.self, forKey: .maxToolListPages) ?? 64
+            let rounds = try container.decodeIfPresent(Int.self, forKey: .maxRounds) ?? 10
+            guard Self.isValidTimeout(timeout), pages > 0, rounds > 0 else {
+                throw DecodingError.dataCorrupted(
+                    .init(
+                        codingPath: container.codingPath,
+                        debugDescription: "Client limits must be finite and positive"
+                    )
+                )
+            }
+            self.init(
+                strict: strict,
+                discoveryProbeTimeout: timeout,
+                maxToolListPages: pages,
+                maxRounds: rounds
+            )
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(strict, forKey: .strict)
+            try container.encode(discoveryProbeTimeout, forKey: .discoveryProbeTimeout)
+            try container.encode(maxToolListPages, forKey: .maxToolListPages)
+            try container.encode(maxRounds, forKey: .maxRounds)
+        }
+
+        private static func isValidTimeout(_ timeout: TimeInterval) -> Bool {
+            timeout.isFinite && timeout > 0
         }
     }
 
@@ -143,16 +212,16 @@ public actor Client {
     }
 
     /// The connection to the server
-    private var connection: (any Transport)?
+    var connection: (any Transport)?
     /// The logger for the client
-    private var logger: Logger? {
+    var logger: Logger? {
         get async {
             await connection?.logger
         }
     }
 
     /// The client information
-    private let clientInfo: Client.Info
+    let clientInfo: Client.Info
     /// The client name
     public nonisolated var name: String { clientInfo.name }
     /// A human-readable client title
@@ -166,24 +235,31 @@ public actor Client {
     public var configuration: Configuration
 
     /// The server capabilities
-    private var serverCapabilities: Server.Capabilities?
+    var serverCapabilities: Server.Capabilities?
     /// The server version
-    private var serverVersion: String?
+    var serverVersion: String?
     /// The server instructions
-    private var instructions: String?
+    var instructions: String?
+
+    var connectionInfo: ConnectionInfo?
+    var transportDelivery: TransportDelivery?
+    var negotiationProbeID: ID?
+    var cancellationHandlerRegistered = false
+    var modernSubscriptions: [ID: ClientSubscriptionState] = [:]
+    var modernDeliveryTasks: [ID: Task<Void, Never>] = [:]
 
     /// A dictionary of type-erased notification handlers, keyed by method name
     private var notificationHandlers: [String: [NotificationHandlerBox]] = [:]
     /// Method handlers for server-to-client requests
-    private var methodHandlers: [String: RequestHandlerBox] = [:]
+    var methodHandlers: [String: RequestHandlerBox] = [:]
     /// The task for the message handling loop
-    private var task: Task<Void, Never>?
+    var task: Task<Void, Never>?
 
     /// A dictionary of type-erased pending requests, keyed by request ID
-    private var pendingRequests: [ID: AnyPendingRequest] = [:]
+    var pendingRequests: [ID: AnyPendingRequest] = [:]
     // Add reusable JSON encoder/decoder
-    private let encoder = JSONEncoder()
-    private let decoder = JSONDecoder()
+    let encoder = JSONEncoder()
+    let decoder = JSONDecoder()
 
     public init(
         name: String,
@@ -205,79 +281,7 @@ public actor Client {
     /// Connect to the server using the given transport
     @discardableResult
     public func connect(transport: any Transport) async throws -> Initialize.Result {
-        self.connection = transport
-        try await self.connection?.connect()
-
-        await logger?.debug(
-            "Client connected", metadata: ["name": "\(name)", "version": "\(version)"])
-
-        // Start message handling loop
-        task = Task {
-            guard let connection = self.connection else { return }
-            repeat {
-                // Check for cancellation before starting the iteration
-                if Task.isCancelled { break }
-
-                do {
-                    let stream = await connection.receive()
-                    for try await data in stream {
-                        if Task.isCancelled { break }  // Check inside loop too
-
-                        // Attempt to decode data
-                        // Try decoding as a batch response first
-                        if let batchResponse = try? decoder.decode([AnyResponse].self, from: data) {
-                            await handleBatchResponse(batchResponse)
-                        } else if let response = try? decoder.decode(AnyResponse.self, from: data) {
-                            await handleResponse(response)
-                        } else if let request = try? decoder.decode(AnyRequest.self, from: data) {
-                            await handleIncomingRequest(request)
-                        } else if let message = try? decoder.decode(AnyMessage.self, from: data) {
-                            await handleMessage(message)
-                        } else {
-                            var metadata: Logger.Metadata = [:]
-                            if let string = String(data: data, encoding: .utf8) {
-                                metadata["message"] = .string(string)
-                            }
-                            await logger?.warning(
-                                "Unexpected message received by client (not single/batch response or notification)",
-                                metadata: metadata
-                            )
-                        }
-                    }
-                } catch let error where MCPError.isResourceTemporarilyUnavailable(error) {
-                    try? await Task.sleep(for: .milliseconds(10))
-                    continue
-                } catch {
-                    await logger?.error(
-                        "Error in message handling loop", metadata: ["error": "\(error)"])
-                    break
-                }
-            } while true
-            await self.logger?.debug("Client message handling loop task is terminating.")
-        }
-
-        // Register cancellation notification handler
-        await self.onNotification(CancelledNotification.self) { [weak self] message in
-            guard let self = self else { return }
-
-            let requestId = message.params.requestId
-            let reason = message.params.reason
-
-            await self.logger?.debug(
-                "Received cancellation notification",
-                metadata: [
-                    "requestId": requestId.map { "\($0)" } ?? "none",
-                    "reason": reason.map { "\($0)" } ?? "none",
-                ]
-            )
-
-            // Remove the pending request and resume with cancellation error
-            if let requestId = requestId,
-                let pendingRequest = await self.removePendingRequest(id: requestId)
-            {
-                pendingRequest.resume(throwing: CancellationError())
-            }
-        }
+        try await establishConnection(transport: transport, delivery: .byteStream)
 
         // Automatically initialize after connecting
         return try await _initialize()
@@ -291,16 +295,32 @@ public actor Client {
         let taskToCancel = self.task
         let connectionToDisconnect = self.connection
         let pendingRequestsToCancel = self.pendingRequests
+        let subscriptionsToCancel = self.modernSubscriptions
+        let deliveryTasksToCancel = self.modernDeliveryTasks
 
         self.task = nil
         self.connection = nil
-        self.pendingRequests = [:]  // Use empty dictionary literal
+        self.connectionInfo = nil
+        self.transportDelivery = nil
+        self.negotiationProbeID = nil
+        self.pendingRequests = [:]
+        self.modernSubscriptions = [:]
+        self.modernDeliveryTasks = [:]
 
         // Part 2: Outside actor - Resume continuations, disconnect transport, await task
 
         // Resume continuations first
         for (_, request) in pendingRequestsToCancel {
             request.resume(throwing: MCPError.internalError("Client disconnected"))
+        }
+        for task in deliveryTasksToCancel.values {
+            task.cancel()
+        }
+        for (id, subscription) in subscriptionsToCancel {
+            subscription.deliveryTask?.cancel()
+            subscription.acknowledgement?.resume(throwing: MCPError.connectionClosed)
+            subscription.continuation.finish(throwing: MCPError.connectionClosed)
+            await logger?.debug("Subscription cancelled", metadata: ["id": "\(id)"])
         }
         await logger?.debug("Pending requests cancelled.")
 
@@ -464,7 +484,7 @@ public actor Client {
         return try await context.value
     }
 
-    private func addPendingRequest<T: Sendable & Decodable>(
+    func addPendingRequest<T: Sendable & Decodable>(
         id: ID,
         continuation: CheckedContinuation<T, Swift.Error>,
         type: T.Type  // Keep type for AnyPendingRequest internal logic
@@ -474,7 +494,7 @@ public actor Client {
         )
     }
 
-    private func removePendingRequest(id: ID) -> AnyPendingRequest? {
+    func removePendingRequest(id: ID) -> AnyPendingRequest? {
         return pendingRequests.removeValue(forKey: id)
     }
 
@@ -640,7 +660,7 @@ public actor Client {
     }
 
     /// Internal initialization implementation
-    private func _initialize() async throws -> Initialize.Result {
+    func _initialize() async throws -> Initialize.Result {
         let request = Initialize.request(
             .init(
                 protocolVersion: Version.latest,
@@ -656,7 +676,7 @@ public actor Client {
 
         // For HTTP transport, ensure subsequent MCP-Protocol-Version headers
         // reflect the negotiated lifecycle version.
-        if let httpTransport = connection as? HTTPClientTransport {
+        if let httpTransport = connection as? any HTTPRequestSendingTransport {
             await httpTransport.updateNegotiatedProtocolVersion(result.protocolVersion)
         }
 
@@ -959,20 +979,32 @@ public actor Client {
 
     // MARK: -
 
-    private func handleResponse(_ response: Response<AnyMethod>) async {
+    func handleResponse(_ response: Response<AnyMethod>) async {
         await logger?.trace(
             "Processing response",
             metadata: ["id": "\(response.id)"])
 
+        if handleSubscriptionResponse(response) {
+            return
+        }
+
+        modernDeliveryTasks.removeValue(forKey: response.id)?.cancel()
+
         // Attempt to remove the pending request using the response ID.
         // Resume with the response only if it hadn't yet been removed.
         if let removedRequest = self.removePendingRequest(id: response.id) {
+            let isNegotiationProbe = negotiationProbeID == response.id
+            if isNegotiationProbe {
+                negotiationProbeID = nil
+            }
             // If we successfully removed it, resume its continuation.
             switch response.result {
             case .success(let value):
                 removedRequest.resume(returning: value)
             case .failure(let error):
-                removedRequest.resume(throwing: error)
+                removedRequest.resume(
+                    throwing: isNegotiationProbe ? DiscoveryRemoteError(error: error) : error
+                )
             }
         } else {
             // Request was already removed (e.g., by send error handler or disconnect).
@@ -984,10 +1016,14 @@ public actor Client {
         }
     }
 
-    private func handleMessage(_ message: Message<AnyNotification>) async {
+    func handleMessage(_ message: Message<AnyNotification>) async {
         await logger?.trace(
             "Processing notification",
             metadata: ["method": "\(message.method)"])
+
+        if await handleSubscriptionMessage(message) {
+            return
+        }
 
         // Find notification handlers for this method
         guard let handlers = notificationHandlers[message.method] else { return }
@@ -1007,7 +1043,7 @@ public actor Client {
         }
     }
 
-    private func handleIncomingRequest(_ request: Request<AnyMethod>) async {
+    func handleIncomingRequest(_ request: Request<AnyMethod>) async {
         await logger?.trace(
             "Processing incoming request from server",
             metadata: ["method": "\(request.method)", "id": "\(request.id)"])
@@ -1065,29 +1101,16 @@ public actor Client {
     }
 
     // Add handler for batch responses
-    private func handleBatchResponse(_ responses: [AnyResponse]) async {
+    func handleBatchResponse(_ responses: [AnyResponse]) async {
         await logger?.trace("Processing batch response", metadata: ["count": "\(responses.count)"])
         for response in responses {
-            // Attempt to remove the pending request.
-            // If successful, pendingRequest contains the request.
-            if let pendingRequest = self.removePendingRequest(id: response.id) {
-                // If we successfully removed it, handle the response using the pending request.
-                switch response.result {
-                case .success(let value):
-                    pendingRequest.resume(returning: value)
-                case .failure(let error):
-                    pendingRequest.resume(throwing: error)
-                }
-            } else {
-                // If removal failed, it means the request ID was not found (or already handled).
-                // Log a warning.
-                await logger?.warning(
-                    "Received response in batch for unknown or already handled request ID",
-                    metadata: ["id": "\(response.id)"]
-                )
-            }
+            await handleResponse(response)
         }
     }
+}
+
+struct DiscoveryRemoteError: Swift.Error, Sendable {
+    let error: MCPError
 }
 
 // MARK: - Codable
