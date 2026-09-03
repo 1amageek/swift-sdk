@@ -680,6 +680,18 @@ public actor StatelessHTTPServerTransport: Transport, HTTPContextProviding, Exch
             )
         }
 
+        if let requestID = bodyFields?["id"] {
+            switch requestID {
+            case .string, .int:
+                break
+            default:
+                return .error(
+                    statusCode: 400,
+                    .invalidRequest("Modern HTTP request id must be a string or integer")
+                )
+            }
+        }
+
         switch messageKind {
         case .request, .notification:
             break

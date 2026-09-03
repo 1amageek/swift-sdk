@@ -792,6 +792,24 @@ struct MCP26TransportTests {
         await transport.disconnect()
     }
 
+    @Test("Modern admission rejects an explicit null request ID")
+    func modernNullRequestIDIsNotANotification() async throws {
+        let transport = StatelessHTTPServerTransport(
+            validationPipeline: StandardValidationPipeline(validators: [])
+        )
+        try await transport.connect()
+
+        let body = Data(
+            #"{"jsonrpc":"2.0","id":null,"method":"tools/call","params":{"name":"echo","arguments":{},"_meta":{"protocolVersion":"2026-07-28","clientCapabilities":{}}}}"#.utf8
+        )
+        let response = await transport.handleRequest(
+            makeModernRequest(path: "/null-id", body: body)
+        )
+        #expect(response.statusCode == 400)
+        #expect(errorCode(response) == -32600)
+        await transport.disconnect()
+    }
+
     @Test("Modern origin policy is supplied by the configured validation pipeline")
     func modernInvalidOriginReturnsForbidden() async throws {
         let transport = StatelessHTTPServerTransport()
