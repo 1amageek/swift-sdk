@@ -47,15 +47,14 @@ struct ProtocolCoreTests {
         #expect(decoded == request)
     }
 
-    @Test("Modern successful results require resultType while legacy results default to complete")
-    func modernResultTypeIsRequired() throws {
+    @Test("Successful results without resultType default to complete in every era")
+    func absentResultTypeDefaultsToComplete() throws {
         let response = Response<TestMethod>(id: 1, result: .success(.object(["value": .string("ok")])))
         let data = try JSONEncoder().encode(response)
 
-        #expect(throws: ProtocolCoreError.self) {
-            try MessageCodec(era: .modern).decode(Response<TestMethod>.self, from: data)
-        }
+        let modern = try MessageCodec(era: .modern).decodeResultEnvelope(from: data)
         let legacy = try MessageCodec(era: .legacy).decodeResultEnvelope(from: data)
+        #expect(modern.resultType == .complete)
         #expect(legacy.resultType == .complete)
     }
 
@@ -185,12 +184,12 @@ struct ProtocolCoreTests {
         ])
     }
 
-    @Test("Result envelopes require resultType and validate known combinations")
+    @Test("Result envelopes default to complete and validate known combinations")
     func resultEnvelopeValidation() throws {
         let missingType = Data(#"{"value":"ok"}"#.utf8)
-        #expect(throws: ProtocolCoreError.self) {
-            try JSONDecoder().decode(ResultEnvelope.self, from: missingType)
-        }
+        let defaulted = try JSONDecoder().decode(ResultEnvelope.self, from: missingType)
+        #expect(defaulted.resultType == .complete)
+        #expect(defaulted.fields["value"] == .string("ok"))
 
         let completeWithInput = Data(#"{"resultType":"complete","inputRequests":{}}"#.utf8)
         #expect(throws: ProtocolCoreError.self) {
@@ -220,6 +219,7 @@ struct ProtocolCoreTests {
             .headerMismatch("method mismatch"),
             .missingRequiredClientCapability(required: ["roots": .object([:])]),
             .unsupportedProtocolVersion(requested: "2027-01-01", supported: [Version.modern]),
+            .resourceNotFound(uri: "test://missing"),
         ]
 
         for error in errors {

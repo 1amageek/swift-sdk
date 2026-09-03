@@ -9,6 +9,18 @@ import Testing
 
 #if swift(>=6.1) && !os(Linux)
 
+    private actor RegistrationRequestCapture {
+        private var request: URLRequest?
+
+        func save(_ request: URLRequest) {
+            self.request = request
+        }
+
+        func value() -> URLRequest? {
+            request
+        }
+    }
+
     @Suite("OAuthClientRegistrar", .serialized)
     struct OAuthClientRegistrarTests {
 
@@ -110,6 +122,32 @@ import Testing
             let resultValue = try #require(result)
             let expected = OAuthConfiguration.TokenEndpointAuthentication.none(clientID: "registered-client")
             #expect(resultValue.updatedAuthentication == expected)
+        }
+
+        @Test("Includes native application type in dynamic registration")
+        func testRegisterIncludesNativeApplicationType() async throws {
+            let body = try successRegistrationBody()
+            let (session, key) = makeIsolatedSession()
+            let capture = RegistrationRequestCapture()
+            await IsolatedMockURLProtocol.setHandler(key: key) { request in
+                await capture.save(request)
+                let response = HTTPURLResponse(
+                    url: self.registrationEndpoint, statusCode: 201,
+                    httpVersion: nil, headerFields: nil)!
+                return (response, body)
+            }
+
+            _ = try await registrar.register(
+                configuration: makeConfig(authentication: .none(clientID: "")),
+                asMetadata: makeASMetadata(registrationEndpoint: registrationEndpoint),
+                session: session
+            )
+
+            let request = try #require(await capture.value())
+            let requestBody = try #require(readRequestBody(request))
+            let payload = try #require(
+                JSONSerialization.jsonObject(with: requestBody) as? [String: Any])
+            #expect(payload["application_type"] as? String == "native")
         }
 
         @Test("Throws on 4xx registration response")

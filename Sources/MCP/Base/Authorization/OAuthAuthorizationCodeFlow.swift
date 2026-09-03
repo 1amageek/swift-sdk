@@ -23,6 +23,8 @@ protocol OAuthAuthorizationCodeFlowing: Sendable {
         authorizationURL: URL,
         redirectURI: URL,
         state: String,
+        expectedIssuer: String?,
+        authorizationResponseIssParameterSupported: Bool?,
         delegate: (any OAuthAuthorizationDelegate)?,
         session: URLSession
     ) async throws -> String
@@ -124,12 +126,35 @@ public struct OAuthAuthorizationCodeFlow: Sendable {
         delegate: (any OAuthAuthorizationDelegate)?,
         session: URLSession
     ) async throws -> String {
+        try await perform(
+            authorizationURL: authorizationURL,
+            redirectURI: redirectURI,
+            state: state,
+            expectedIssuer: nil,
+            authorizationResponseIssParameterSupported: nil,
+            delegate: delegate,
+            session: session
+        )
+    }
+
+    func perform(
+        authorizationURL: URL,
+        redirectURI: URL,
+        state: String,
+        expectedIssuer: String?,
+        authorizationResponseIssParameterSupported: Bool?,
+        delegate: (any OAuthAuthorizationDelegate)?,
+        session: URLSession
+    ) async throws -> String {
         if let delegate {
             let redirectURL = try await delegate.presentAuthorizationURL(authorizationURL)
             return try extractCode(
                 from: redirectURL,
                 expectedRedirectURI: redirectURI,
-                expectedState: state
+                expectedState: state,
+                expectedIssuer: expectedIssuer,
+                authorizationResponseIssParameterSupported:
+                    authorizationResponseIssParameterSupported
             )
         }
 
@@ -168,7 +193,9 @@ public struct OAuthAuthorizationCodeFlow: Sendable {
         return try extractCode(
             from: redirectURL,
             expectedRedirectURI: redirectURI,
-            expectedState: state
+            expectedState: state,
+            expectedIssuer: expectedIssuer,
+            authorizationResponseIssParameterSupported: authorizationResponseIssParameterSupported
         )
     }
 
@@ -183,6 +210,22 @@ public struct OAuthAuthorizationCodeFlow: Sendable {
         from redirectURL: URL,
         expectedRedirectURI: URL,
         expectedState: String
+    ) throws -> String {
+        try extractCode(
+            from: redirectURL,
+            expectedRedirectURI: expectedRedirectURI,
+            expectedState: expectedState,
+            expectedIssuer: nil,
+            authorizationResponseIssParameterSupported: nil
+        )
+    }
+
+    func extractCode(
+        from redirectURL: URL,
+        expectedRedirectURI: URL,
+        expectedState: String,
+        expectedIssuer: String?,
+        authorizationResponseIssParameterSupported: Bool?
     ) throws -> String {
         guard
             let redirectComponents = URLComponents(url: redirectURL, resolvingAgainstBaseURL: false),
@@ -202,12 +245,9 @@ public struct OAuthAuthorizationCodeFlow: Sendable {
             )
         }
 
-        guard
-            let state = redirectComponents.queryItems?.first(where: {
-                $0.name == OAuthParameterName.state
-            })?.value,
-            !state.isEmpty
-        else {
+        let queryItems = redirectComponents.queryItems ?? []
+        let stateItems = queryItems.filter { $0.name == OAuthParameterName.state }
+        guard stateItems.count == 1, let state = stateItems[0].value, !state.isEmpty else {
             throw OAuthAuthorizationError.authorizationResponseMissingState
         }
 
@@ -218,13 +258,29 @@ public struct OAuthAuthorizationCodeFlow: Sendable {
             )
         }
 
-        guard
-            let code = redirectComponents.queryItems?.first(where: {
-                $0.name == OAuthParameterName.code
-            })?.value,
-            !code.isEmpty
-        else {
+        let codeItems = queryItems.filter { $0.name == OAuthParameterName.code }
+        guard codeItems.count == 1, let code = codeItems[0].value, !code.isEmpty else {
             throw OAuthAuthorizationError.authorizationResponseMissingCode
+        }
+
+        let issuerValues = queryItems.compactMap { item -> String? in
+            guard item.name == "iss" else { return nil }
+            return item.value ?? ""
+        }
+        guard issuerValues.count <= 1 else {
+            throw OAuthAuthorizationError.authorizationServerIssuerMismatch(
+                expected: expectedIssuer ?? "", actual: issuerValues.joined(separator: ",")
+            )
+        }
+        if authorizationResponseIssParameterSupported == true, issuerValues.isEmpty {
+            throw OAuthAuthorizationError.authorizationResponseMissingIssuer
+        }
+        if let receivedIssuer = issuerValues.first, let expectedIssuer,
+            receivedIssuer != expectedIssuer
+        {
+            throw OAuthAuthorizationError.authorizationServerIssuerMismatch(
+                expected: expectedIssuer, actual: receivedIssuer
+            )
         }
 
         return code

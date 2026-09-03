@@ -174,27 +174,16 @@ extension Client {
     private func negotiateConnection(
         preference: ConnectionPreference
     ) async throws -> ConnectionInfo {
+        let metadata = try makeRequestMetadata()
+        let parameters = try Value(ModernRequestParameters(metadata: metadata))
         do {
-            let metadata = try makeRequestMetadata()
-            let parameters = try Value(ModernRequestParameters(metadata: metadata))
-            let value = try await sendDiscoveryProbe(parameters: parameters)
-            let result = try decode(DiscoverResult.self, from: value)
-            guard result.supportedVersions.contains(Version.modern) else {
-                throw MCPError.unsupportedProtocolVersion(
-                    requested: Version.modern,
-                    supported: result.supportedVersions
-                )
-            }
-            serverVersion = Version.modern
-            instructions = result.instructions
-            return try ConnectionInfo(
-                era: .modern,
-                protocolVersion: Version.modern,
-                serverCapabilities: result.capabilities,
-                serverInfo: result.metadata?.serverInfo,
-                instructions: result.instructions
-            )
+            return try await discoverModernServer(parameters: parameters)
         } catch let remote as DiscoveryRemoteError {
+            if case .unsupportedProtocolVersion(_, let supported) = remote.error,
+                supported.contains(Version.modern)
+            {
+                return try await discoverModernServer(parameters: parameters)
+            }
             if Self.isRecognizedModernError(remote.error) || preference == .modernOnly {
                 throw remote.error
             }
@@ -205,6 +194,26 @@ extension Client {
             }
             return try await fallBackToLegacy()
         }
+    }
+
+    private func discoverModernServer(parameters: Value) async throws -> ConnectionInfo {
+        let value = try await sendDiscoveryProbe(parameters: parameters)
+        let result = try decode(DiscoverResult.self, from: value)
+        guard result.supportedVersions.contains(Version.modern) else {
+            throw MCPError.unsupportedProtocolVersion(
+                requested: Version.modern,
+                supported: result.supportedVersions
+            )
+        }
+        serverVersion = Version.modern
+        instructions = result.instructions
+        return try ConnectionInfo(
+            era: .modern,
+            protocolVersion: Version.modern,
+            serverCapabilities: result.capabilities,
+            serverInfo: result.metadata?.serverInfo,
+            instructions: result.instructions
+        )
     }
 
     private func fallBackToLegacy() async throws -> ConnectionInfo {

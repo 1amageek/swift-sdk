@@ -255,6 +255,7 @@ public actor HTTPClientTransport: Transport, HTTPRequestSendingTransport {
         }
 
         var attempts = 0
+        var scopeUpgradeAttempts = 0
         let operationKey = jsonRPCOperationKey(from: data)
 
         while true {
@@ -296,6 +297,13 @@ public actor HTTPClientTransport: Transport, HTTPRequestSendingTransport {
             } catch let authError as HTTPAuthenticationChallengeError {
                 guard let authorizer else {
                     throw mapAuthenticationChallengeError(authError)
+                }
+
+                if authError.statusCode == 403 {
+                    scopeUpgradeAttempts += 1
+                    guard scopeUpgradeAttempts <= authorizer.maxScopeUpgradeAttempts else {
+                        throw mapAuthenticationChallengeError(authError)
+                    }
                 }
 
                 let handled: Bool

@@ -45,11 +45,17 @@ actor HTTPApp {
     /// Factory function to create MCP Server instances for each session.
     typealias ServerFactory = @Sendable (String, StatefulHTTPServerTransport) async throws -> Server
 
+    /// Factory function to create the single process-scoped modern server.
+    typealias ModernServerFactory = @Sendable (StatelessHTTPServerTransport) async throws -> Server
+
     private let configuration: Configuration
     private let serverFactory: ServerFactory
+    private let modernServerFactory: ModernServerFactory?
     private let validationPipeline: (any HTTPRequestValidationPipeline)?
     private var channel: Channel?
     private var sessions: [String: SessionContext] = [:]
+    private var modernTransport: StatelessHTTPServerTransport?
+    private var modernServer: Server?
 
     nonisolated let logger: Logger
 
@@ -74,10 +80,12 @@ actor HTTPApp {
         configuration: Configuration = Configuration(),
         validationPipeline: (any HTTPRequestValidationPipeline)? = nil,
         serverFactory: @escaping ServerFactory,
+        modernServerFactory: ModernServerFactory? = nil,
         logger: Logger? = nil
     ) {
         self.configuration = configuration
         self.serverFactory = serverFactory
+        self.modernServerFactory = modernServerFactory
         self.validationPipeline = validationPipeline
         self.logger = logger ?? Logger(
             label: "mcp.http.app",
@@ -91,11 +99,13 @@ actor HTTPApp {
         port: Int = 3000,
         endpoint: String = "/mcp",
         serverFactory: @escaping ServerFactory,
+        modernServerFactory: ModernServerFactory? = nil,
         logger: Logger? = nil
     ) {
         self.init(
             configuration: Configuration(host: host, port: port, endpoint: endpoint),
             serverFactory: serverFactory,
+            modernServerFactory: modernServerFactory,
             logger: logger
         )
     }
@@ -108,6 +118,19 @@ actor HTTPApp {
     /// The call blocks until the server is shut down via ``stop()``.
     func start() async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
+
+        if let modernServerFactory {
+            let transport = StatelessHTTPServerTransport(logger: logger)
+            do {
+                let server = try await modernServerFactory(transport)
+                try await server.start(transport: transport)
+                modernTransport = transport
+                modernServer = server
+            } catch {
+                await transport.disconnect()
+                throw error
+            }
+        }
 
         let bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(ChannelOptions.backlog, value: 256)
@@ -140,6 +163,13 @@ actor HTTPApp {
     /// Stops the HTTP application gracefully, closing all sessions.
     func stop() async {
         await closeAllSessions()
+        if let modernServer {
+            await modernServer.stop()
+        } else {
+            await modernTransport?.disconnect()
+        }
+        modernServer = nil
+        modernTransport = nil
         try? await channel?.close()
         channel = nil
         logger.info("MCP HTTP application stopped")
@@ -155,6 +185,16 @@ actor HTTPApp {
     /// - POST requests with an `initialize` body create a new session.
     /// - All other requests without a session return an error.
     func handleHTTPRequest(_ request: HTTPRequest) async -> HTTPResponse {
+        if isModernRequest(request) {
+            guard let modernTransport else {
+                return .error(
+                    statusCode: 500,
+                    .internalError("Modern server is not available")
+                )
+            }
+            return await modernTransport.handleRequest(request)
+        }
+
         let sessionID = request.header(HTTPHeaderName.sessionID)
 
         // Route to existing session
@@ -189,6 +229,38 @@ actor HTTPApp {
             statusCode: 400,
             .invalidRequest("Bad Request: Missing \(HTTPHeaderName.sessionID) header")
         )
+    }
+
+    /// Classifies the request for routing only. Validation and protocol
+    /// semantics remain owned by the selected SDK transport and Server.
+    private func isModernRequest(_ request: HTTPRequest) -> Bool {
+        if let rawVersion = request.header(HTTPHeaderName.protocolVersion) {
+            let version = rawVersion.trimmingCharacters(in: .whitespacesAndNewlines)
+            if version == Version.modern || !Version.supported.contains(version) {
+                return true
+            }
+        }
+
+        let hasModernHeader = request.headers.keys.contains { key in
+            let lowercased = key.lowercased()
+            return lowercased == HTTPHeaderName.method.lowercased()
+                || lowercased == HTTPHeaderName.name.lowercased()
+                || lowercased.hasPrefix(HTTPHeaderName.parameterPrefix.lowercased())
+        }
+        if hasModernHeader { return true }
+
+        guard let body = request.body else { return false }
+        do {
+            guard let object = try JSONSerialization.jsonObject(with: body) as? [String: Any],
+                let params = object["params"] as? [String: Any],
+                let metadata = params["_meta"] as? [String: Any]
+            else {
+                return false
+            }
+            return metadata[RequestMetadata.protocolVersionKey] != nil
+        } catch {
+            return false
+        }
     }
 
     // MARK: - Session Management
@@ -250,8 +322,15 @@ actor HTTPApp {
     }
 
     private func sessionCleanupLoop() async {
-        while true {
-            try? await Task.sleep(for: .seconds(60))
+        while !Task.isCancelled {
+            do {
+                try await Task.sleep(for: .seconds(60))
+            } catch is CancellationError {
+                return
+            } catch {
+                logger.warning("Session cleanup loop stopped", metadata: ["error": "\(error)"])
+                return
+            }
 
             let now = Date()
             let expired = sessions.filter { _, context in

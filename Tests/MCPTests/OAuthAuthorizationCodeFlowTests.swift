@@ -175,4 +175,78 @@ struct OAuthAuthorizationCodeFlowTests {
         )
         #expect(code == "auth-code-123")
     }
+
+    @Test("extractCode accepts an exact authorization response issuer")
+    func testExtractCodeAcceptsMatchingIssuer() throws {
+        let issuer = "https://auth.example.com"
+        let redirectURL = URL(string:
+            "https://app.example.com/callback?code=auth-code-123&state=my-state&iss=\(issuer)")!
+        let code = try flow.extractCode(
+            from: redirectURL,
+            expectedRedirectURI: redirectURI,
+            expectedState: "my-state",
+            expectedIssuer: issuer,
+            authorizationResponseIssParameterSupported: true
+        )
+        #expect(code == "auth-code-123")
+    }
+
+    @Test("extractCode accepts an absent issuer when support is not advertised")
+    func testExtractCodeAcceptsAbsentUnadvertisedIssuer() throws {
+        let redirectURL = URL(string:
+            "https://app.example.com/callback?code=auth-code-123&state=my-state")!
+        let code = try flow.extractCode(
+            from: redirectURL,
+            expectedRedirectURI: redirectURI,
+            expectedState: "my-state",
+            expectedIssuer: "https://auth.example.com",
+            authorizationResponseIssParameterSupported: nil
+        )
+        #expect(code == "auth-code-123")
+    }
+
+    @Test("extractCode rejects a missing required authorization response issuer")
+    func testExtractCodeRejectsMissingRequiredIssuer() {
+        let redirectURL = URL(string:
+            "https://app.example.com/callback?code=auth-code-123&state=my-state")!
+        #expect(throws: OAuthAuthorizationError.self) {
+            try flow.extractCode(
+                from: redirectURL,
+                expectedRedirectURI: redirectURI,
+                expectedState: "my-state",
+                expectedIssuer: "https://auth.example.com",
+                authorizationResponseIssParameterSupported: true
+            )
+        }
+    }
+
+    @Test("extractCode compares authorization response issuer as an exact string")
+    func testExtractCodeRejectsNormalizedIssuer() {
+        let redirectURL = URL(string:
+            "https://app.example.com/callback?code=auth-code-123&state=my-state&iss=https://auth.example.com/")!
+        #expect(throws: OAuthAuthorizationError.self) {
+            try flow.extractCode(
+                from: redirectURL,
+                expectedRedirectURI: redirectURI,
+                expectedState: "my-state",
+                expectedIssuer: "https://auth.example.com",
+                authorizationResponseIssParameterSupported: false
+            )
+        }
+    }
+
+    @Test("extractCode rejects duplicate authorization response parameters")
+    func testExtractCodeRejectsDuplicateAuthorizationResponseParameters() {
+        let redirectURL = URL(string:
+            "https://app.example.com/callback?code=one&code=two&state=my-state&iss=https://auth.example.com")!
+        #expect(throws: OAuthAuthorizationError.self) {
+            try flow.extractCode(
+                from: redirectURL,
+                expectedRedirectURI: redirectURI,
+                expectedState: "my-state",
+                expectedIssuer: "https://auth.example.com",
+                authorizationResponseIssParameterSupported: true
+            )
+        }
+    }
 }

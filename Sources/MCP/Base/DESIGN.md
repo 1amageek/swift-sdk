@@ -61,13 +61,13 @@ model trees.
 | Contract | Guarantee |
 | --- | --- |
 | JSON-RPC compatibility | Existing legacy request, response, notification, and arbitrary `Value` payloads remain decodable and encodable without semantic loss. |
-| Era-aware wire rules | Supported legacy-family behavior (`2024-11-05` through `2025-11-25`) remains tolerant where the existing API requires it; `2026-07-28` requires request `_meta` and response `resultType` where the modern schema requires them. |
+| Era-aware wire rules | Supported legacy-family behavior (`2024-11-05` through `2025-11-25`) remains tolerant where the existing API requires it; `2026-07-28` requires request `_meta`, defaults an absent response `resultType` to `complete`, and requires an explicit `input_required` value for MRTR. |
 | Metadata | Modern request metadata contains required protocol version and client capability fields; optional client info and extension fields remain distinguishable. Result cache hints and opaque request state are preserved as values. |
 | MRTR values | Input-required results distinguish complete from input-required state, preserve opaque `requestState`, and carry keyed input requests/responses without inventing application decisions. `InputResponse` stores only its raw wire value; the caller supplies the originating method to `validate(for:)`, because the open union may be ambiguous when extension fields are present. |
 | Subscription values | Subscription filters, acknowledgement metadata, and terminal results are represented as protocol data; stream ownership remains in orchestration/transport. |
 | Header derivation | The resolver uses an iterative worklist over the finite acyclic caller-owned `Value`; only statically reachable `properties` produce bindings. Non-properties branches are inspected for forbidden annotations. Work is O(schema nodes), temporary storage is O(schema depth), and immutable bindings live for one operation. Invalid or duplicate `x-mcp-header` annotations exclude the tool; null/missing values are omitted; string/integer/boolean values use the specified safe encoding. |
 | Schema boundary | Tool-header schema walks are finite and local to the caller-owned acyclic `Value`; no arbitrary node-count threshold is imposed, no network `$ref` is dereferenced, and Base owns traversal complexity but no pagination. Client owns paginated discovery through `maxToolListPages = 64`; Server separately owns request-local current-authorization tool-schema lookup through `maxToolSchemaLookupPages = 64`. |
-| Failure | Missing/invalid modern fields, mismatched versions, unsupported capabilities, and invalid header annotations produce typed failures rather than empty success. A finite schema walk terminates without an arbitrary size rejection; malformed or unsupported values remain failures, and network `$ref` targets are never fetched. Client and Server report their own pagination-bound and cursor-cycle failures. |
+| Failure | Missing required request metadata, invalid explicit modern fields, mismatched versions, unsupported capabilities, invalid header annotations, and missing resources produce typed failures rather than empty success. `ResourceNotFound` uses `-32602` and preserves the requested URI in error data. An absent response `resultType` is the specified `complete` default, not a failure. A finite schema walk terminates without an arbitrary size rejection; malformed or unsupported values remain failures, and network `$ref` targets are never fetched. Client and Server report their own pagination-bound and cursor-cycle failures. |
 
 `ConnectionInfo`, `ProtocolEra`, and typed modern failure values are internal or
 public only at the API boundary where the module design requires them. Their
@@ -108,9 +108,8 @@ session key by Base.
 
 - Base values are `Sendable` where the public module contract requires it; no
   shared mutable registry is introduced.
-- A modern result must identify whether it is complete or requires input. A
-  legacy result without `resultType` is interpreted as complete only on the
-  legacy path.
+- A result without `resultType` is interpreted as `complete` in every supported
+  era. Input-required results must carry the explicit `input_required` value.
 - Resolver traversal uses an iterative worklist over a finite acyclic
   caller-owned `Value`, performs O(schema nodes) work with O(schema depth)
   temporary storage, has no arbitrary schema-node rejection threshold, and

@@ -46,6 +46,27 @@ struct MCP26ClientTests {
         await client.disconnect()
     }
 
+    @Test("Unsupported modern discovery retries once with a fresh request ID")
+    func supportedVersionRetry() async throws {
+        let responder = DiscoveryRetryResponder()
+        let transport = ScriptedClientTransport { data in
+            try await responder.respond(to: data)
+        }
+        let client = Client(name: "client", version: "1")
+
+        let info = try await client.connect(
+            transport: transport,
+            preference: .modernOnly,
+            delivery: .byteStream
+        )
+
+        let ids = await transport.sentRequestIDs(for: ServerDiscover.name)
+        #expect(info.era == .modern)
+        #expect(ids.count == 2)
+        #expect(ids[0] != ids[1])
+        await client.disconnect()
+    }
+
     @Test("Recognized modern error never falls back")
     func recognizedModernError() async {
         let transport = ScriptedClientTransport { data in
@@ -1205,6 +1226,31 @@ private actor ScriptedClientTransport: Transport {
             }
             queued.removeAll(keepingCapacity: true)
         }
+    }
+}
+
+private actor DiscoveryRetryResponder {
+    private var attempt = 0
+
+    func respond(to data: Data) throws -> Data {
+        attempt += 1
+        let request = try JSONDecoder().decode(Request<ServerDiscover>.self, from: data)
+        if attempt == 1 {
+            return try JSONEncoder().encode(
+                ServerDiscover.response(
+                    id: request.id,
+                    error: .unsupportedProtocolVersion(
+                        requested: Version.modern,
+                        supported: [Version.modern]
+                    )
+                )
+            )
+        }
+        let result = DiscoverResult(
+            supportedVersions: [Version.modern],
+            cacheHint: try CacheHint(scope: .private, ttlMs: 0)
+        )
+        return try JSONEncoder().encode(ServerDiscover.response(id: request.id, result: result))
     }
 }
 

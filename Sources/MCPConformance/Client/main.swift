@@ -20,34 +20,142 @@ import MCP
 
 // MARK: - Scenario Handlers
 
-typealias ScenarioHandler = ([String]) async throws -> Void
+typealias ScenarioHandler = @Sendable ([String]) async throws -> Void
+
+private enum ConformanceProtocolMode: Sendable {
+    case modern
+    case legacy
+
+    init(environment: [String: String]) throws {
+        let requested = environment["MCP_CONFORMANCE_PROTOCOL_VERSION"] ?? Version.latest
+        guard Version.allSupported.contains(requested) else {
+            throw ConformanceError.invalidArguments(
+                "Unsupported MCP_CONFORMANCE_PROTOCOL_VERSION: \(requested)"
+            )
+        }
+        self = requested == Version.modern ? .modern : .legacy
+    }
+
+}
+
+private func conformanceProtocolMode() throws -> ConformanceProtocolMode {
+    try ConformanceProtocolMode(environment: ProcessInfo.processInfo.environment)
+}
+
+private func connectClient(
+    _ client: Client,
+    transport: HTTPClientTransport,
+    mode: ConformanceProtocolMode
+) async throws {
+    switch mode {
+    case .modern:
+        _ = try await client.connect(
+            transport: transport,
+            preference: .modernOnly,
+            delivery: .http
+        )
+    case .legacy:
+        _ = try await client.connect(transport: transport)
+    }
+}
+
+private func listTools(
+    with client: Client,
+    mode: ConformanceProtocolMode
+) async throws -> [Tool] {
+    switch mode {
+    case .modern:
+        return try await client.sendModern(ListTools.request(.init())).value.tools
+    case .legacy:
+        return try await client.listTools().tools
+    }
+}
+
+private func callTool(
+    with client: Client,
+    mode: ConformanceProtocolMode,
+    name: String,
+    arguments: [String: Value]? = nil
+) async throws {
+    switch mode {
+    case .modern:
+        _ = try await client.sendModern(
+            CallTool.request(.init(name: name, arguments: arguments))
+        )
+    case .legacy:
+        _ = try await client.callTool(name: name, arguments: arguments)
+    }
+}
+
+private func makeHTTPTransport(
+    endpoint: URL,
+    logger: Logger,
+    streaming: Bool = true,
+    authorizer: (any HTTPClientAuthorizer)? = nil
+) -> HTTPClientTransport {
+    HTTPClientTransport(
+        endpoint: endpoint,
+        streaming: streaming,
+        authorizer: authorizer,
+        logger: logger
+    )
+}
+
+private let scoredAuthorizationScenarios: Set<String> = [
+    "auth/metadata-default",
+    "auth/metadata-var1",
+    "auth/metadata-var2",
+    "auth/metadata-var3",
+    "auth/basic-cimd",
+    "auth/scope-from-www-authenticate",
+    "auth/scope-from-scopes-supported",
+    "auth/scope-omitted-when-undefined",
+    "auth/scope-step-up",
+    "auth/scope-retry-limit",
+    "auth/token-endpoint-auth-basic",
+    "auth/token-endpoint-auth-post",
+    "auth/token-endpoint-auth-none",
+    "auth/pre-registration",
+    "auth/resource-mismatch",
+    "auth/offline-access-scope",
+    "auth/offline-access-not-supported",
+    "auth/authorization-server-migration",
+    "auth/iss-supported",
+    "auth/iss-not-advertised",
+    "auth/iss-supported-missing",
+    "auth/iss-wrong-issuer",
+    "auth/iss-unexpected",
+    "auth/iss-normalized",
+    "auth/metadata-issuer-mismatch",
+]
 
 // MARK: - Authorization Scenarios
 
-private func loadConformanceContext() -> [String: String] {
+private func loadConformanceValueContext() throws -> [String: Value] {
     let env = ProcessInfo.processInfo.environment
 
-    if let raw = env["MCP_CONFORMANCE_CONTEXT"],
-        let data = raw.data(using: .utf8),
-        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-    {
-        var parsed: [String: String] = [:]
-        for (key, value) in json {
-            if let value = value as? String {
-                parsed[key] = value
-            }
+    if let raw = env["MCP_CONFORMANCE_CONTEXT"] {
+        do {
+            return try JSONDecoder().decode([String: Value].self, from: Data(raw.utf8))
+        } catch {
+            throw ConformanceError.invalidArguments(
+                "MCP_CONFORMANCE_CONTEXT is not valid JSON: \(error.localizedDescription)"
+            )
         }
-        return parsed
     }
 
-    var parsed: [String: String] = [:]
+    var parsed: [String: Value] = [:]
     if let clientID = env["MCP_CONFORMANCE_CLIENT_ID"] {
-        parsed["client_id"] = clientID
+        parsed["client_id"] = .string(clientID)
     }
     if let clientSecret = env["MCP_CONFORMANCE_CLIENT_SECRET"] {
-        parsed["client_secret"] = clientSecret
+        parsed["client_secret"] = .string(clientSecret)
     }
     return parsed
+}
+
+private func loadStringConformanceContext() throws -> [String: String] {
+    try loadConformanceValueContext().compactMapValues(\.stringValue)
 }
 
 private func percentEncodeFormValue(_ value: String) -> String {
@@ -320,14 +428,15 @@ func runAuthorizationScenario(scenario: String, args: [String]) async throws {
         throw ConformanceError.invalidArguments("Valid server URL is required")
     }
 
-    let context = loadConformanceContext()
+    let mode = try conformanceProtocolMode()
+    let context = try loadStringConformanceContext()
     let oauthConfig = makeOAuthConfiguration(for: scenario, context: context)
 
-    let transport = HTTPClientTransport(
+    let transport = makeHTTPTransport(
         endpoint: serverURL,
+        logger: logger,
         streaming: true,
-        authorizer: OAuthAuthorizer(configuration: oauthConfig),
-        logger: logger
+        authorizer: OAuthAuthorizer(configuration: oauthConfig)
     )
 
     let client = Client(name: "test-client", version: "1.0.0")
@@ -335,7 +444,7 @@ func runAuthorizationScenario(scenario: String, args: [String]) async throws {
     // Scenarios that expect the connection to fail with a specific error.
     if scenario == "auth/resource-mismatch" {
         do {
-            _ = try await client.connect(transport: transport)
+            try await connectClient(client, transport: transport, mode: mode)
             throw ConformanceError.invalidArguments(
                 "Expected authorization to fail with resource mismatch, but connection succeeded"
             )
@@ -352,15 +461,23 @@ func runAuthorizationScenario(scenario: String, args: [String]) async throws {
         return
     }
 
-    _ = try await client.connect(transport: transport)
+    try await connectClient(client, transport: transport, mode: mode)
 
     // Exercise both initialization and regular request paths.
-    let (tools, _) = try await client.listTools()
+    let tools = try await listTools(with: client, mode: mode)
     logger.debug("Auth scenario listed tools", metadata: ["count": "\(tools.count)"])
 
     // Trigger an additional request for scenarios that involve runtime scope behavior.
-    if scenario.contains("scope"), let firstTool = tools.first {
-        _ = try? await client.callTool(name: firstTool.name, arguments: [:])
+    if scenario.contains("scope") {
+        guard let firstTool = tools.first else {
+            throw ConformanceError.invalidArguments(
+                "Scope scenario did not expose a tool for the runtime scope request"
+            )
+        }
+        try await callTool(with: client, mode: mode, name: firstTool.name, arguments: [:])
+    }
+    if scenario == "auth/authorization-server-migration" {
+        _ = try await listTools(with: client, mode: mode)
     }
 
     await client.disconnect()
@@ -385,8 +502,10 @@ func runInitializeScenario(_ args: [String]) async throws {
         throw ConformanceError.invalidArguments("Valid server URL is required")
     }
 
+    let mode = try conformanceProtocolMode()
+
     // Create HTTP transport
-    let transport = HTTPClientTransport(
+    let transport = makeHTTPTransport(
         endpoint: serverURL,
         logger: logger
     )
@@ -395,14 +514,11 @@ func runInitializeScenario(_ args: [String]) async throws {
     let client = Client(name: "test-client", version: "1.0.0")
 
     // Connect
-    let initResult = try await client.connect(transport: transport)
-    logger.debug("Successfully connected to MCP server", metadata: [
-        "serverName": "\(initResult.serverInfo.name)",
-        "serverVersion": "\(initResult.serverInfo.version)"
-    ])
+    try await connectClient(client, transport: transport, mode: mode)
+    logger.debug("Successfully connected to MCP server")
 
     // List tools
-    let (tools, _) = try await client.listTools()
+    let tools = try await listTools(with: client, mode: mode)
     logger.debug("Successfully listed tools", metadata: [
         "toolCount": "\(tools.count)"
     ])
@@ -429,8 +545,10 @@ func runToolsCallScenario(_ args: [String]) async throws {
         throw ConformanceError.invalidArguments("Valid server URL is required")
     }
 
+    let mode = try conformanceProtocolMode()
+
     // Create HTTP transport
-    let transport = HTTPClientTransport(
+    let transport = makeHTTPTransport(
         endpoint: serverURL,
         logger: logger
     )
@@ -439,28 +557,26 @@ func runToolsCallScenario(_ args: [String]) async throws {
     let client = Client(name: "test-client", version: "1.0.0")
 
     // Connect
-    try await client.connect(transport: transport)
+    try await connectClient(client, transport: transport, mode: mode)
     logger.debug("Successfully connected to MCP server")
 
     // List tools
-    let (tools, _) = try await client.listTools()
+    let tools = try await listTools(with: client, mode: mode)
     logger.debug("Successfully listed tools", metadata: [
         "toolCount": "\(tools.count)"
     ])
 
     // Call the add_numbers tool
-    if tools.contains(where: { $0.name == "add_numbers" }) {
-        let result = try await client.callTool(
-            name: "add_numbers",
-            arguments: ["a": 5, "b": 3]
-        )
-        logger.debug("Tool call result", metadata: [
-            "isError": "\(result.isError ?? false)",
-            "contentCount": "\(result.content.count)"
-        ])
-    } else {
-        logger.warning("add_numbers tool not found")
+    guard tools.contains(where: { $0.name == "add_numbers" }) else {
+        throw ConformanceError.invalidArguments("add_numbers tool not found")
     }
+    try await callTool(
+        with: client,
+        mode: mode,
+        name: "add_numbers",
+        arguments: ["a": 5, "b": 3]
+    )
+    logger.debug("Tool call completed")
 
     // Disconnect
     await client.disconnect()
@@ -486,22 +602,21 @@ func runSSEScenario(_ args: [String]) async throws {
         throw ConformanceError.invalidArguments("Valid server URL is required")
     }
 
+    let mode = try conformanceProtocolMode()
+
     // Create HTTP transport with streaming enabled
-    let transport = HTTPClientTransport(
+    let transport = makeHTTPTransport(
         endpoint: serverURL,
-        streaming: true,
-        logger: logger
+        logger: logger,
+        streaming: true
     )
 
     // Create client
     let client = Client(name: "test-client", version: "1.0.0")
 
     // Connect - this will start the SSE stream in the background
-    let initResult = try await client.connect(transport: transport)
-    logger.debug("Successfully connected to MCP server", metadata: [
-        "serverName": "\(initResult.serverInfo.name)",
-        "serverVersion": "\(initResult.serverInfo.version)"
-    ])
+    try await connectClient(client, transport: transport, mode: mode)
+    logger.debug("Successfully connected to MCP server")
 
     // Give the GET SSE stream time to establish
     try await Task.sleep(for: .milliseconds(500))
@@ -510,11 +625,13 @@ func runSSEScenario(_ args: [String]) async throws {
     // The server will close the POST SSE stream without the response,
     // then deliver it on the GET SSE stream after we reconnect.
     logger.debug("Calling test_reconnection tool...")
-    let result = try await client.callTool(name: "test_reconnection", arguments: [:])
-    logger.debug("Tool call result received", metadata: [
-        "isError": "\(result.isError ?? false)",
-        "contentCount": "\(result.content.count)"
-    ])
+    try await callTool(
+        with: client,
+        mode: mode,
+        name: "test_reconnection",
+        arguments: [:]
+    )
+    logger.debug("Tool call result received")
 
     // Keep the connection open briefly for the test to collect timing data
     try await Task.sleep(for: .seconds(2))
@@ -542,11 +659,13 @@ func runElicitationSEP1034ClientDefaults(_ args: [String]) async throws {
         throw ConformanceError.invalidArguments("Valid server URL is required")
     }
 
+    let mode = try conformanceProtocolMode()
+
     // Create HTTP transport with streaming enabled for bidirectional communication
-    let transport = HTTPClientTransport(
+    let transport = makeHTTPTransport(
         endpoint: serverURL,
-        streaming: true,
-        logger: logger
+        logger: logger,
+        streaming: true
     )
 
     // Create client with elicitation capabilities
@@ -588,28 +707,28 @@ func runElicitationSEP1034ClientDefaults(_ args: [String]) async throws {
     }
 
     // Connect
-    try await client.connect(transport: transport)
+    try await connectClient(client, transport: transport, mode: mode)
     logger.debug("Successfully connected to MCP server")
 
     // List tools
-    let (tools, _) = try await client.listTools()
+    let tools = try await listTools(with: client, mode: mode)
     logger.debug("Successfully listed tools", metadata: [
         "toolCount": "\(tools.count)"
     ])
 
     // Call the test_client_elicitation_defaults tool
-    if tools.contains(where: { $0.name == "test_client_elicitation_defaults" }) {
-        let result = try await client.callTool(
-            name: "test_client_elicitation_defaults",
-            arguments: [:]
+    guard tools.contains(where: { $0.name == "test_client_elicitation_defaults" }) else {
+        throw ConformanceError.invalidArguments(
+            "test_client_elicitation_defaults tool not found"
         )
-        logger.debug("Tool call result", metadata: [
-            "isError": "\(result.isError ?? false)",
-            "contentCount": "\(result.content.count)"
-        ])
-    } else {
-        logger.warning("test_client_elicitation_defaults tool not found")
     }
+    try await callTool(
+        with: client,
+        mode: mode,
+        name: "test_client_elicitation_defaults",
+        arguments: [:]
+    )
+    logger.debug("Tool call completed")
 
     // Disconnect
     await client.disconnect()
@@ -617,53 +736,165 @@ func runElicitationSEP1034ClientDefaults(_ args: [String]) async throws {
     logger.debug("Elicitation client defaults scenario completed successfully")
 }
 
-// MARK: - Default Handler for Unimplemented Scenarios
+// MARK: - Modern Scored Scenarios
 
-/// Default handler that performs basic connection test for unimplemented scenarios
-func runDefaultScenario(_ args: [String]) async throws {
+private func runModernScoredScenario(scenario: String, args: [String]) async throws {
     var logger = Logger(
-        label: "mcp.conformance.client.default",
+        label: "mcp.conformance.client.modern",
         factory: { StreamLogHandler.standardError(label: $0) }
     )
     logger.logLevel = .debug
 
-    logger.debug("Running default scenario handler")
-
-    // Get server URL from args
     guard let serverURLString = args.last,
-          let serverURL = URL(string: serverURLString) else {
+        let serverURL = URL(string: serverURLString)
+    else {
         throw ConformanceError.invalidArguments("Valid server URL is required")
     }
+    let mode = try conformanceProtocolMode()
+    guard case .modern = mode else {
+        throw ConformanceError.invalidArguments(
+            "Scenario \(scenario) requires protocol version \(Version.modern)"
+        )
+    }
 
-    // Create HTTP transport
-    let transport = HTTPClientTransport(
+    let transport = makeHTTPTransport(
         endpoint: serverURL,
         logger: logger
     )
+    let client = Client(
+        name: "test-client",
+        version: "1.0.0",
+        capabilities: .init(
+            sampling: .init(),
+            elicitation: .init(),
+            roots: .init()
+        )
+    )
+    await client.withRootsHandler {
+        [Root(uri: "file:///workspace", name: "conformance-workspace")]
+    }
+    await client.withSamplingHandler { _ in
+        CreateSamplingMessage.Result(
+            model: "conformance-model",
+            stopReason: .endTurn,
+            role: .assistant,
+            content: .text("conformance response")
+        )
+    }
+    await client.withElicitationHandler { _ in
+        CreateElicitation.Result(action: .accept, content: ["confirmed": true])
+    }
 
-    // Create client
-    let client = Client(name: "test-client", version: "1.0.0")
+    try await connectClient(client, transport: transport, mode: mode)
+    do {
+        switch scenario {
+        case "request-metadata":
+            _ = try await listTools(with: client, mode: mode)
 
-    // Connect
-    let initResult = try await client.connect(transport: transport)
-    logger.debug("Successfully connected to MCP server", metadata: [
-        "serverName": "\(initResult.serverInfo.name)",
-        "serverVersion": "\(initResult.serverInfo.version)"
-    ])
+        case "sep-2322-client-request-state":
+            for name in [
+                "test_mrtr_echo_state",
+                "test_mrtr_no_state",
+                "test_mrtr_unrelated",
+                "test_mrtr_no_result_type",
+            ] {
+                try await callTool(with: client, mode: mode, name: name, arguments: [:])
+            }
 
-    // Disconnect
-    await client.disconnect()
+        case "http-standard-headers":
+            let tools = try await listTools(with: client, mode: mode)
+            guard let tool = tools.first else {
+                throw ConformanceError.invalidArguments("Header scenario returned no tools")
+            }
+            try await callTool(with: client, mode: mode, name: tool.name, arguments: [:])
 
-    logger.debug("Default scenario completed successfully")
+            let resources = try await client.sendModern(
+                ListResources.request(.init())
+            ).value.resources
+            guard let resource = resources.first else {
+                throw ConformanceError.invalidArguments("Header scenario returned no resources")
+            }
+            _ = try await client.sendModern(
+                ReadResource.request(.init(uri: resource.uri))
+            )
+
+            let prompts = try await client.sendModern(
+                ListPrompts.request(.init())
+            ).value.prompts
+            guard let prompt = prompts.first else {
+                throw ConformanceError.invalidArguments("Header scenario returned no prompts")
+            }
+            _ = try await client.sendModern(
+                GetPrompt.request(.init(name: prompt.name))
+            )
+
+        case "http-custom-headers":
+            guard let calls = try loadConformanceValueContext()["toolCalls"]?.arrayValue else {
+                throw ConformanceError.invalidArguments(
+                    "http-custom-headers requires context.toolCalls"
+                )
+            }
+            for call in calls {
+                guard let fields = call.objectValue,
+                    let name = fields["name"]?.stringValue,
+                    let arguments = fields["arguments"]?.objectValue
+                else {
+                    throw ConformanceError.invalidArguments(
+                        "Each context.toolCalls entry requires name and arguments"
+                    )
+                }
+                try await callTool(
+                    with: client,
+                    mode: mode,
+                    name: name,
+                    arguments: arguments
+                )
+            }
+
+        case "http-invalid-tool-headers":
+            try await callTool(
+                with: client,
+                mode: mode,
+                name: "valid_tool",
+                arguments: ["region": "us-west1"]
+            )
+
+        case "json-schema-ref-no-deref":
+            _ = try await listTools(with: client, mode: mode)
+
+        default:
+            throw ConformanceError.invalidArguments("Unsupported modern scenario: \(scenario)")
+        }
+        await client.disconnect()
+    } catch {
+        await client.disconnect()
+        throw error
+    }
 }
 
 // MARK: - Scenario Registry
 
-nonisolated(unsafe) let scenarioHandlers: [String: ScenarioHandler] = [
+let scenarioHandlers: [String: ScenarioHandler] = [
     "initialize": runInitializeScenario,
     "tools_call": runToolsCallScenario,
     "sse-retry": runSSEScenario,
     "elicitation-sep1034-client-defaults": runElicitationSEP1034ClientDefaults,
+    "request-metadata": { try await runModernScoredScenario(scenario: "request-metadata", args: $0) },
+    "sep-2322-client-request-state": {
+        try await runModernScoredScenario(scenario: "sep-2322-client-request-state", args: $0)
+    },
+    "http-standard-headers": {
+        try await runModernScoredScenario(scenario: "http-standard-headers", args: $0)
+    },
+    "http-custom-headers": {
+        try await runModernScoredScenario(scenario: "http-custom-headers", args: $0)
+    },
+    "http-invalid-tool-headers": {
+        try await runModernScoredScenario(scenario: "http-invalid-tool-headers", args: $0)
+    },
+    "json-schema-ref-no-deref": {
+        try await runModernScoredScenario(scenario: "json-schema-ref-no-deref", args: $0)
+    },
 ]
 
 // MARK: - Error Types
@@ -705,14 +936,12 @@ struct ConformanceClient {
             let handler: ScenarioHandler
             if let explicitHandler = scenarioHandlers[scenario] {
                 handler = explicitHandler
-            } else if scenario.hasPrefix("auth/") {
+            } else if scoredAuthorizationScenarios.contains(scenario) {
                 handler = { args in
                     try await runAuthorizationScenario(scenario: scenario, args: args)
                 }
             } else {
-                handler = runDefaultScenario
-                var stderr = StandardError()
-                print("⚠️  Scenario '\(scenario)' not fully implemented - using default handler", to: &stderr)
+                throw ConformanceError.invalidArguments("Unsupported scenario: \(scenario)")
             }
 
             // Run the scenario

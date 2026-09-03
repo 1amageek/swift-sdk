@@ -652,22 +652,31 @@ public actor StatelessHTTPServerTransport: Transport, HTTPContextProviding, Exch
                 .headerMismatch("Empty \(HTTPHeaderName.protocolVersion) header")
             )
         }
+        if let metadataVersion = bodyFields?["params"]?.objectValue?["_meta"]?
+            .objectValue?[RequestMetadata.protocolVersionKey]?.stringValue,
+            metadataVersion != version
+        {
+            return modernAdmissionError(
+                .headerMismatch("\(HTTPHeaderName.protocolVersion) does not match _meta"),
+                bodyFields: bodyFields
+            )
+        }
         guard Version.allSupported.contains(version) else {
-            return .error(
-                statusCode: 400,
+            return modernAdmissionError(
                 .unsupportedProtocolVersion(
                     requested: version,
                     supported: [Version.modern]
-                )
+                ),
+                bodyFields: bodyFields
             )
         }
         guard version == Version.modern else {
-            return .error(
-                statusCode: 400,
+            return modernAdmissionError(
                 .unsupportedProtocolVersion(
                     requested: version,
                     supported: [Version.modern]
-                )
+                ),
+                bodyFields: bodyFields
             )
         }
 
@@ -724,6 +733,39 @@ public actor StatelessHTTPServerTransport: Transport, HTTPContextProviding, Exch
         }
 
         return nil
+    }
+
+    private func modernAdmissionError(
+        _ error: MCPError,
+        bodyFields: [String: Value]?
+    ) -> HTTPResponse {
+        let requestID: ID?
+        switch bodyFields?["id"] {
+        case .string(let value):
+            requestID = .string(value)
+        case .int(let value):
+            requestID = .number(value)
+        default:
+            requestID = nil
+        }
+        guard let requestID else {
+            return .error(statusCode: 400, error)
+        }
+        do {
+            let data = try JSONEncoder().encode(
+                AnyMethod.response(id: requestID, error: error)
+            )
+            return .dataWithStatus(
+                statusCode: 400,
+                data: data,
+                headers: [HTTPHeaderName.contentType: ContentType.json]
+            )
+        } catch {
+            return .error(
+                statusCode: 500,
+                .internalError("Failed to encode admission error")
+            )
+        }
     }
 
     private func decodedJSONObject(from body: Data) -> [String: Value]? {

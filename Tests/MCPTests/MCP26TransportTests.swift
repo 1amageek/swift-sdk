@@ -302,11 +302,38 @@ struct MCP26TransportTests {
         let unsupportedVersion = await transport.handleRequest(
             makeModernRequest(
                 path: "/unsupported",
+                body: makeModernBody(
+                    id: "unsupported",
+                    metadataVersion: "2027-01-01"
+                ),
                 headers: [HTTPHeaderName.protocolVersion: "2027-01-01"]
             )
         )
         #expect(unsupportedVersion.statusCode == 400)
         #expect(errorCode(unsupportedVersion) == -32022)
+        let unsupportedBody = try #require(unsupportedVersion.bodyData)
+        let unsupportedFields = try #require(
+            try JSONDecoder().decode(Value.self, from: unsupportedBody).objectValue
+        )
+        #expect(unsupportedFields["id"] == .string("unsupported"))
+        #expect(unsupportedFields["error"]?.objectValue?["data"] == .object([
+            "requested": .string("2027-01-01"),
+            "supported": .array([.string(Version.modern)]),
+        ]))
+
+        let mismatchedVersion = await transport.handleRequest(
+            makeModernRequest(
+                path: "/mismatch",
+                body: makeModernBody(id: "mismatch", metadataVersion: "2027-01-01")
+            )
+        )
+        #expect(mismatchedVersion.statusCode == 400)
+        #expect(errorCode(mismatchedVersion) == -32020)
+        let mismatchBody = try #require(mismatchedVersion.bodyData)
+        let mismatchFields = try #require(
+            try JSONDecoder().decode(Value.self, from: mismatchBody).objectValue
+        )
+        #expect(mismatchFields["id"] == .string("mismatch"))
 
         let responseBody = makeModernResponseBody()
         let response = await transport.handleRequest(
@@ -408,7 +435,7 @@ struct MCP26TransportTests {
     }
 
     @Test(
-        "Modern transport forwards method, name, and metadata semantics to Server",
+        "Modern transport forwards method and name semantics to Server",
         .timeLimit(.minutes(1))
     )
     func modernSemanticValuesAreForwardedToServer() async throws {
@@ -423,7 +450,7 @@ struct MCP26TransportTests {
             await transport.handleRequest(
                 makeModernRequest(
                     path: "/server-validation",
-                    body: makeModernBody(name: "body-name", metadataVersion: "2025-11-25"),
+                    body: makeModernBody(name: "body-name"),
                     headers: [
                         HTTPHeaderName.method: "resources/read",
                         HTTPHeaderName.name: "header-name",

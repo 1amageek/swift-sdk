@@ -776,16 +776,10 @@ extension Server {
         request: AnyRequest,
         context: HandlerContext
     ) throws {
-        guard let metadata = context.requestMetadata else {
+        guard context.requestMetadata != nil else {
             throw MCPError.invalidParams("Modern requests require _meta")
         }
         guard let httpContext = context.httpContext else { return }
-
-        if let version = httpContext.header(HTTPHeaderName.protocolVersion),
-            version != metadata.protocolVersion
-        {
-            throw MCPError.headerMismatch("\(HTTPHeaderName.protocolVersion) does not match _meta")
-        }
 
         guard let method = httpContext.header(HTTPHeaderName.method) else {
             throw MCPError.headerMismatch("Missing \(HTTPHeaderName.method) header")

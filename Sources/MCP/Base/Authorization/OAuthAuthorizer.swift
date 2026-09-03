@@ -8,6 +8,176 @@ import Foundation
     import CryptoKit
 #endif
 
+private func authorizationServersMatch(_ lhs: URL, _ rhs: URL) -> Bool {
+    lhs.absoluteString == rhs.absoluteString
+}
+
+private final class OAuthAuthorizationServerSnapshot: @unchecked Sendable {
+    private let lock = NSLock()
+    private var authorizationServer: URL?
+    private var resource: URL?
+
+    init() {}
+
+    func update(authorizationServer: URL?, resource: URL?) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.authorizationServer = authorizationServer
+        self.resource = resource
+    }
+
+    func read() -> (authorizationServer: URL?, resource: URL?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (authorizationServer, resource)
+    }
+
+}
+
+private actor OAuthAuthorizerCore {
+    private struct OperationWaiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Void, any Error>
+    }
+
+    struct State: Sendable {
+        var authentication: OAuthConfiguration.TokenEndpointAuthentication
+        var selectedAuthorizationServer: URL?
+        var selectedResource: URL?
+        var protectedResourceMetadata: OAuthProtectedResourceMetadata?
+        var authorizationServerMetadata: OAuthAuthorizationServerMetadata?
+        var cachedProtectedResourceMetadataURL: URL?
+        var clientRegistrationAttempted: Bool
+        var clientSecretExpiresAt: Date?
+    }
+
+    private var state: State
+    private let tokenStorage: any TokenStorage
+    private let authorizationServerSnapshot: OAuthAuthorizationServerSnapshot
+    private var operationInProgress = false
+    private var operationWaiters: [OperationWaiter] = []
+
+    init(
+        authentication: OAuthConfiguration.TokenEndpointAuthentication,
+        tokenStorage: any TokenStorage,
+        authorizationServerSnapshot: OAuthAuthorizationServerSnapshot
+    ) {
+        self.state = State(
+            authentication: authentication,
+            selectedAuthorizationServer: nil,
+            selectedResource: nil,
+            protectedResourceMetadata: nil,
+            authorizationServerMetadata: nil,
+            cachedProtectedResourceMetadataURL: nil,
+            clientRegistrationAttempted: false,
+            clientSecretExpiresAt: nil
+        )
+        self.tokenStorage = tokenStorage
+        self.authorizationServerSnapshot = authorizationServerSnapshot
+    }
+
+    func snapshot() -> State {
+        state
+    }
+
+    func update<Result>(_ body: (inout State) -> Result) -> Result {
+        let result = body(&state)
+        clearStoredTokenWithMismatchedContext()
+        authorizationServerSnapshot.update(
+            authorizationServer: state.selectedAuthorizationServer,
+            resource: state.selectedResource
+        )
+        return result
+    }
+
+    func loadToken() -> OAuthAccessToken? {
+        guard let token = tokenStorage.load() else { return nil }
+        if hasMismatchedBinding(token) {
+            tokenStorage.clear()
+            return nil
+        }
+        return token
+    }
+
+    func saveToken(_ token: OAuthAccessToken) {
+        if hasMismatchedBinding(token) {
+            tokenStorage.clear()
+            return
+        }
+        tokenStorage.save(token)
+    }
+
+    func clearToken() {
+        tokenStorage.clear()
+    }
+
+    func beginOperation() async throws {
+        try Task.checkCancellation()
+        guard operationInProgress else {
+            operationInProgress = true
+            return
+        }
+
+        let waiterID = UUID()
+        try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, any Error>) in
+                guard !Task.isCancelled else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                operationWaiters.append(
+                    OperationWaiter(id: waiterID, continuation: continuation))
+            }
+        }, onCancel: {
+            Task { await self.cancelOperationWaiter(waiterID) }
+        })
+
+        do {
+            try Task.checkCancellation()
+        } catch {
+            endOperation()
+            throw error
+        }
+    }
+
+    func endOperation() {
+        if operationWaiters.isEmpty {
+            operationInProgress = false
+        } else {
+            let waiter = operationWaiters.removeFirst()
+            waiter.continuation.resume()
+        }
+    }
+
+    private func cancelOperationWaiter(_ id: UUID) {
+        guard let index = operationWaiters.firstIndex(where: { $0.id == id }) else { return }
+        let waiter = operationWaiters.remove(at: index)
+        waiter.continuation.resume(throwing: CancellationError())
+    }
+
+    private func clearStoredTokenWithMismatchedContext() {
+        guard let token = tokenStorage.load(), hasMismatchedBinding(token) else { return }
+        tokenStorage.clear()
+    }
+
+    private func hasMismatchedBinding(_ token: OAuthAccessToken) -> Bool {
+        guard let selectedAuthorizationServer = state.selectedAuthorizationServer,
+            let selectedResource = state.selectedResource
+        else {
+            return false
+        }
+        guard let tokenAuthorizationServer = token.authorizationServer,
+            let tokenResource = token.resource
+        else {
+            return true
+        }
+        return !authorizationServersMatch(tokenAuthorizationServer, selectedAuthorizationServer)
+            || tokenResource.absoluteString != selectedResource.absoluteString
+    }
+
+}
+
 // MARK: - HTTPClientAuthorizer Protocol
 
 /// Abstraction used by ``HTTPClientTransport`` to handle OAuth authorization challenges.
@@ -23,6 +193,9 @@ public protocol HTTPClientAuthorizer: AnyObject, Sendable {
     /// ``HTTPClientTransport`` will not call ``handleChallenge(statusCode:headers:endpoint:operationKey:session:)``
     /// more than this many times for a single outgoing request.
     var maxAuthorizationAttempts: Int { get }
+
+    /// The maximum number of scope-upgrade retries permitted for one outgoing request.
+    var maxScopeUpgradeAttempts: Int { get }
 
     /// Validates that the MCP endpoint URL satisfies the security requirements for OAuth.
     ///
@@ -47,8 +220,8 @@ public protocol HTTPClientAuthorizer: AnyObject, Sendable {
     ///   - statusCode: The HTTP status code (401 or 403).
     ///   - headers: All response headers from the challenge response.
     ///   - endpoint: The MCP endpoint that returned the challenge.
-    ///   - operationKey: An optional identifier for the MCP operation (e.g., the JSON-RPC method),
-    ///     used to track step-up attempts per operation.
+    ///   - operationKey: An optional informational identifier for the MCP operation. Retry
+    ///     accounting remains owned by the outgoing HTTP logical request.
     ///   - session: The `URLSession` to use for discovery and token requests.
     /// - Returns: `true` if a new token was acquired and the original request should be retried;
     ///   `false` if the challenge cannot be handled.
@@ -74,6 +247,8 @@ public protocol HTTPClientAuthorizer: AnyObject, Sendable {
 }
 
 extension HTTPClientAuthorizer {
+    public var maxScopeUpgradeAttempts: Int { maxAuthorizationAttempts }
+
     public func prepareAuthorization(for endpoint: URL, session: URLSession) async throws {}
 }
 
@@ -106,23 +281,19 @@ extension HTTPClientAuthorizer {
 /// let transport = HTTPClientTransport(endpoint: serverURL, authorizer: authorizer)
 /// ```
 ///
-/// - Important: This type is `@unchecked Sendable`. All mutable state is accessed
-///   exclusively through the `HTTPClientTransport` actor, which serializes every call.
-///   Do **not** share a single `OAuthAuthorizer` instance across multiple transports —
-///   doing so would violate the isolation contract and risk concurrent mutation.
+/// - Important: This type is `@unchecked Sendable` because its injected protocol
+///   implementations are caller-owned. The authorizer's own mutable flow state is
+///   serialized by a private actor, and its synchronous issuer view is published through
+///   a lock-protected snapshot. Share one authorizer only between concurrent requests in
+///   the same configured resource and authorization-server context.
 public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
 
-    // MARK: - Mutable State
+    // MARK: - Immutable Configuration and Synchronized State
 
-    private var configuration: OAuthConfiguration
-    private let tokenStorage: TokenStorage
-    private var selectedAuthorizationServer: URL?
-    private var protectedResourceMetadata: OAuthProtectedResourceMetadata?
-    private var authorizationServerMetadata: OAuthAuthorizationServerMetadata?
-    private var cachedProtectedResourceMetadataURL: URL?
-    private var stepUpAttempts: [String: Int] = [:]
-    private var clientRegistrationAttempted = false
-    private var clientSecretExpiresAt: Date?
+    private let configuration: OAuthConfiguration
+    private let tokenStorage: any TokenStorage
+    private let authorizationServerSnapshot: OAuthAuthorizationServerSnapshot
+    private let core: OAuthAuthorizerCore
 
     // MARK: - Composable Dependencies
 
@@ -188,6 +359,13 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
     ) {
         self.configuration = configuration
         self.tokenStorage = tokenStorage
+        let authorizationServerSnapshot = OAuthAuthorizationServerSnapshot()
+        self.authorizationServerSnapshot = authorizationServerSnapshot
+        self.core = OAuthAuthorizerCore(
+            authentication: configuration.authentication,
+            tokenStorage: tokenStorage,
+            authorizationServerSnapshot: authorizationServerSnapshot
+        )
         self.scopeSelector = scopeSelector
         self.challengeParser = challengeParser
         self.urlValidator = urlValidator
@@ -203,19 +381,30 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         configuration.retryPolicy.maxAuthorizationAttempts
     }
 
+    public var maxScopeUpgradeAttempts: Int {
+        configuration.retryPolicy.maxScopeUpgradeAttempts
+    }
+
     public func validateEndpointSecurity(for endpoint: URL) throws {
         try urlValidator.validateHTTPSOrLoopback(endpoint, context: "MCP endpoint")
     }
 
     public func authorizationHeader(for endpoint: URL) -> String? {
         guard let accessToken = tokenStorage.load() else { return nil }
-        if let tokenAuthorizationServer = accessToken.authorizationServer,
-            let selectedAuthorizationServer,
-            !authorizationServersMatch(tokenAuthorizationServer, selectedAuthorizationServer)
-        {
-            tokenStorage.clear()
-            return nil
-        }
+        let context = authorizationServerSnapshot.read()
+        guard let tokenAuthorizationServer = accessToken.authorizationServer,
+            let selectedAuthorizationServer = context.authorizationServer,
+            authorizationServersMatch(tokenAuthorizationServer, selectedAuthorizationServer),
+            let tokenResource = accessToken.resource,
+            let selectedResource = context.resource,
+            tokenResource.absoluteString == selectedResource.absoluteString,
+            let endpointResource = try? discoveryClient.metadataDiscovery
+                .canonicalResourceURI(from: endpoint),
+            discoveryClient.metadataDiscovery.protectedResourceMatches(
+                resource: selectedResource,
+                endpoint: endpointResource
+            )
+        else { return nil }
         if accessToken.isExpired() {
             return nil
         }
@@ -226,26 +415,53 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         statusCode: Int,
         headers: [String: String],
         endpoint: URL,
-        operationKey: String? = nil,
+        operationKey _: String? = nil,
         session: URLSession
     ) async throws -> Bool {
         try validateEndpointSecurity(for: endpoint)
+
+        try await core.beginOperation()
+        do {
+            try Task.checkCancellation()
+            let handled = try await handleChallengeSerially(
+                statusCode: statusCode,
+                headers: headers,
+                endpoint: endpoint,
+                session: session
+            )
+            await core.endOperation()
+            return handled
+        } catch {
+            await core.endOperation()
+            throw error
+        }
+    }
+
+    private func handleChallengeSerially(
+        statusCode: Int,
+        headers: [String: String],
+        endpoint: URL,
+        session: URLSession
+    ) async throws -> Bool {
         let challenge = challengeParser.parseBearer(from: headers)
 
         switch statusCode {
         case 401:
-            if let refreshToken = tokenStorage.load()?.refreshToken {
-                tokenStorage.clear()
+            var refreshedMetadata: OAuthProtectedResourceMetadata?
+            if let refreshToken = await core.loadToken()?.refreshToken {
+                await core.clearToken()
                 let metadata = try await discoverProtectedResourceMetadata(
                     endpoint: endpoint,
                     challenge: challenge,
+                    forceRefresh: true,
                     session: session
                 )
+                refreshedMetadata = metadata
                 let asMetadata = try await resolveAuthorizationServerMetadata(
                     metadata: metadata,
                     session: session
                 )
-                let resource = try canonicalResource(for: endpoint)
+                let resource = try await canonicalResource(for: endpoint)
                 let requestedScopes = scopeSelector.selectScopes(
                     challengeScope: challenge?.scope,
                     scopesSupported: metadata.scopesSupported
@@ -260,14 +476,20 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
                     return true
                 }
             } else {
-                tokenStorage.clear()
+                await core.clearToken()
             }
 
-            let metadata = try await discoverProtectedResourceMetadata(
-                endpoint: endpoint,
-                challenge: challenge,
-                session: session
-            )
+            let metadata: OAuthProtectedResourceMetadata
+            if let refreshedMetadata {
+                metadata = refreshedMetadata
+            } else {
+                metadata = try await discoverProtectedResourceMetadata(
+                    endpoint: endpoint,
+                    challenge: challenge,
+                    forceRefresh: true,
+                    session: session
+                )
+            }
             let requestedScopes = scopeSelector.selectScopes(
                 challengeScope: challenge?.scope,
                 scopesSupported: metadata.scopesSupported
@@ -285,10 +507,11 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
                 context: providerContext,
                 session: session
             ) {
-                storeExternalAccessToken(
+                await storeExternalAccessToken(
                     externalToken,
                     requestedScopes: providerContext.requestedScopes,
-                    authorizationServer: providerContext.authorizationServer
+                    authorizationServer: providerContext.authorizationServer,
+                    resource: providerContext.resource
                 )
                 return true
             }
@@ -315,20 +538,8 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
                     scopesSupported: metadata.scopesSupported
                 ) ?? []
 
-            let existingScopes = tokenStorage.load()?.scopes ?? []
+            let existingScopes = await core.loadToken()?.scopes ?? []
             let upgradedScopes = existingScopes.union(requiredScopes)
-            let resourceKey = try discoveryClient.metadataDiscovery.canonicalResourceURI(
-                from: endpoint
-            ).absoluteString
-            let operationAttemptKey = normalizedOperationKey(operationKey)
-            let attemptKey =
-                "\(resourceKey)|\(operationAttemptKey)|\(upgradedScopes.sorted().joined(separator: " "))"
-            let attempts = stepUpAttempts[attemptKey, default: 0]
-            guard attempts < configuration.retryPolicy.maxScopeUpgradeAttempts else {
-                return false
-            }
-            stepUpAttempts[attemptKey] = attempts + 1
-
             let providerRequestedScopes = upgradedScopes.isEmpty ? nil : upgradedScopes
             let providerContext = try await makeAccessTokenProviderContext(
                 statusCode: statusCode,
@@ -342,10 +553,11 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
                 context: providerContext,
                 session: session
             ) {
-                storeExternalAccessToken(
+                await storeExternalAccessToken(
                     externalToken,
                     requestedScopes: providerContext.requestedScopes,
-                    authorizationServer: providerContext.authorizationServer
+                    authorizationServer: providerContext.authorizationServer,
+                    resource: providerContext.resource
                 )
                 return true
             }
@@ -364,29 +576,64 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
     }
 
     public func prepareAuthorization(for endpoint: URL, session: URLSession) async throws {
+        try await core.beginOperation()
+        do {
+            try Task.checkCancellation()
+            try await prepareAuthorizationSerially(for: endpoint, session: session)
+            await core.endOperation()
+        } catch {
+            await core.endOperation()
+            throw error
+        }
+    }
+
+    private func prepareAuthorizationSerially(for endpoint: URL, session: URLSession) async throws {
+        guard let storedToken = await core.loadToken() else { return }
+        guard storedToken.authorizationServer != nil, storedToken.resource != nil else {
+            await core.clearToken()
+            return
+        }
+
+        let currentState = await core.snapshot()
+        if currentState.selectedAuthorizationServer == nil || currentState.selectedResource == nil {
+            let metadata = try await discoverProtectedResourceMetadata(
+                endpoint: endpoint,
+                challenge: nil,
+                session: session
+            )
+            _ = try await resolveAuthorizationServerMetadata(metadata: metadata, session: session)
+            _ = try await canonicalResource(for: endpoint)
+        }
+
+        guard let token = await core.loadToken() else { return }
         guard configuration.proactiveRefreshWindowSeconds > 0 else { return }
-        guard let token = tokenStorage.load() else { return }
         guard token.isExpired(skewSeconds: configuration.proactiveRefreshWindowSeconds) else {
             return
         }
         guard let refreshToken = token.refreshToken else { return }
-        guard let asMeta = authorizationServerMetadata, asMeta.tokenEndpoint != nil else { return }
+        guard let asMeta = await core.snapshot().authorizationServerMetadata,
+            asMeta.tokenEndpoint != nil
+        else { return }
 
         let resource: URL
         do {
-            resource = try canonicalResource(for: endpoint)
+            resource = try await canonicalResource(for: endpoint)
         } catch {
             return
         }
 
         let requestedScopes = token.scopes.isEmpty ? nil : token.scopes
-        _ = try? await refreshAccessToken(
-            refreshToken: refreshToken,
-            resource: resource,
-            requestedScopes: requestedScopes,
-            asMetadata: asMeta,
-            session: session
-        )
+        do {
+            _ = try await refreshAccessToken(
+                refreshToken: refreshToken,
+                resource: resource,
+                requestedScopes: requestedScopes,
+                asMetadata: asMeta,
+                session: session
+            )
+        } catch {
+            // Proactive refresh is best effort; the challenge path remains authoritative.
+        }
     }
 
     // MARK: - Discovery
@@ -394,16 +641,15 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
     private func discoverProtectedResourceMetadata(
         endpoint: URL,
         challenge: OAuthBearerChallenge?,
+        forceRefresh: Bool = false,
         session: URLSession
     ) async throws -> OAuthProtectedResourceMetadata {
-        if let protectedResourceMetadata {
+        let currentState = await core.snapshot()
+        if !forceRefresh,
+            let protectedResourceMetadata = currentState.protectedResourceMetadata
+        {
             let incomingURL = challenge?.resourceMetadataURL
-            if let incomingURL, incomingURL != cachedProtectedResourceMetadataURL {
-                self.protectedResourceMetadata = nil
-                self.authorizationServerMetadata = nil
-                self.selectedAuthorizationServer = nil
-                self.cachedProtectedResourceMetadataURL = nil
-            } else {
+            if incomingURL == nil || incomingURL == currentState.cachedProtectedResourceMetadataURL {
                 return protectedResourceMetadata
             }
         }
@@ -445,8 +691,21 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
             candidates: candidates, fallbackIssuer: fallbackIssuer, session: session)
         try validateProtectedResource(metadata: metadata, endpoint: endpoint)
 
-        self.protectedResourceMetadata = metadata
-        self.cachedProtectedResourceMetadataURL = candidates.first
+        let authorizationServersChanged =
+            currentState.protectedResourceMetadata?.authorizationServers
+            != metadata.authorizationServers
+        await core.update { state in
+            if authorizationServersChanged {
+                state.authorizationServerMetadata = nil
+                state.selectedAuthorizationServer = nil
+                state.selectedResource = nil
+                state.authentication = configuration.authentication
+                state.clientRegistrationAttempted = false
+                state.clientSecretExpiresAt = nil
+            }
+            state.protectedResourceMetadata = metadata
+            state.cachedProtectedResourceMetadataURL = candidates.first
+        }
         return metadata
     }
 
@@ -481,7 +740,8 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         metadata: OAuthProtectedResourceMetadata,
         session: URLSession
     ) async throws -> OAuthAuthorizationServerMetadata {
-        if let cached = authorizationServerMetadata {
+        let currentState = await core.snapshot()
+        if let cached = currentState.authorizationServerMetadata {
             return cached
         }
 
@@ -490,7 +750,7 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
             try urlValidator.validateAuthorizationServer(
                 override, context: "Authorization server issuer")
             candidates = [override]
-        } else if let selected = selectedAuthorizationServer {
+        } else if let selected = currentState.selectedAuthorizationServer {
             candidates = [selected]
         } else {
             guard !metadata.authorizationServers.isEmpty else {
@@ -501,8 +761,10 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
 
         let (server, asMetadata) = try await discoveryClient.fetchAuthorizationServerMetadata(
             candidates: candidates, session: session)
-        self.selectedAuthorizationServer = server
-        self.authorizationServerMetadata = asMetadata
+        await core.update { state in
+            state.selectedAuthorizationServer = server
+            state.authorizationServerMetadata = asMetadata
+        }
         return asMetadata
     }
 
@@ -517,7 +779,11 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         let asMetadata = try await resolveAuthorizationServerMetadata(
             metadata: metadata, session: session)
         try await maybeRegisterClient(asMetadata: asMetadata, session: session)
-        let resource = try canonicalResource(for: endpoint)
+        let resource = try await canonicalResource(for: endpoint)
+        let authorizationScopes = scopesForAuthorizationCode(
+            requestedScopes: requestedScopes,
+            asMetadata: asMetadata
+        )
 
         switch configuration.grantType {
         case .clientCredentials:
@@ -530,11 +796,25 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         case .authorizationCode:
             try await acquireTokenViaAuthorizationCode(
                 resource: resource,
-                requestedScopes: requestedScopes,
+                requestedScopes: authorizationScopes,
                 asMetadata: asMetadata,
                 session: session
             )
         }
+    }
+
+    private func scopesForAuthorizationCode(
+        requestedScopes: Set<String>?,
+        asMetadata: OAuthAuthorizationServerMetadata
+    ) -> Set<String>? {
+        guard configuration.grantType == .authorizationCode,
+            asMetadata.scopesSupported?.contains("offline_access") == true
+        else {
+            return requestedScopes
+        }
+        var scopes = requestedScopes ?? []
+        scopes.insert("offline_access")
+        return scopes
     }
 
     private func acquireTokenViaClientCredentials(
@@ -553,10 +833,14 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         let decoded = try await tokenEndpointClient.request(
             parameters: &bodyParameters,
             endpoint: tokenEndpoint,
-            authentication: configuration.authentication,
+            authentication: await core.snapshot().authentication,
             session: session
         )
-        storeTokenResponse(decoded, requestedScopes: requestedScopes)
+        await storeTokenResponse(
+            decoded,
+            requestedScopes: requestedScopes,
+            resource: resource
+        )
     }
 
     private func acquireTokenViaAuthorizationCode(
@@ -584,12 +868,14 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         let verifier = PKCE.makeVerifier()
         let challenge = try PKCE.makeChallenge(from: verifier)
         let state = UUID().uuidString
+        let currentState = await core.snapshot()
+        let authentication = currentState.authentication
 
         let authorizationURL = try authCodeFlow.buildURL(
             authorizationEndpoint: authorizationEndpoint,
             resource: resource,
             redirectURI: configuration.authorizationRedirectURI,
-            clientID: configuration.authentication.clientID,
+            clientID: authentication.clientID,
             codeChallenge: challenge,
             scopes: requestedScopes,
             state: state,
@@ -600,6 +886,9 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
             authorizationURL: authorizationURL,
             redirectURI: configuration.authorizationRedirectURI,
             state: state,
+            expectedIssuer: currentState.selectedAuthorizationServer?.absoluteString,
+            authorizationResponseIssParameterSupported:
+                asMetadata.authorizationResponseIssParameterSupported,
             delegate: configuration.authorizationDelegate,
             session: session
         )
@@ -619,10 +908,14 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         let decoded = try await tokenEndpointClient.request(
             parameters: &bodyParameters,
             endpoint: tokenEndpoint,
-            authentication: configuration.authentication,
+            authentication: await core.snapshot().authentication,
             session: session
         )
-        storeTokenResponse(decoded, requestedScopes: requestedScopes)
+        await storeTokenResponse(
+            decoded,
+            requestedScopes: requestedScopes,
+            resource: resource
+        )
     }
 
     // MARK: - Token Refresh
@@ -653,10 +946,14 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
             let decoded = try await tokenEndpointClient.request(
                 parameters: &bodyParameters,
                 endpoint: tokenEndpoint,
-                authentication: configuration.authentication,
+                authentication: await core.snapshot().authentication,
                 session: session
             )
-            storeTokenResponse(decoded, requestedScopes: requestedScopes)
+            await storeTokenResponse(
+                decoded,
+                requestedScopes: requestedScopes,
+                resource: resource
+            )
             return true
         } catch let error as OAuthAuthorizationError {
             if case .tokenRequestFailed(let statusCode, _) = error,
@@ -674,25 +971,36 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         asMetadata: OAuthAuthorizationServerMetadata,
         session: URLSession
     ) async throws {
-        if let expiry = clientSecretExpiresAt, Date() >= expiry {
-            clientSecretExpiresAt = nil
-            clientRegistrationAttempted = false
-            configuration.authentication = .none(clientID: configuration.authentication.clientID)
+        let initialState = await core.snapshot()
+        if let expiry = initialState.clientSecretExpiresAt, Date() >= expiry {
+            await core.update { state in
+                state.clientSecretExpiresAt = nil
+                state.clientRegistrationAttempted = false
+                state.authentication = .none(clientID: state.authentication.clientID)
+            }
         }
 
-        guard !clientRegistrationAttempted else { return }
-        guard case .none = configuration.authentication else { return }
+        let currentState = await core.snapshot()
+        guard !currentState.clientRegistrationAttempted else { return }
+        guard case .none = currentState.authentication else { return }
 
-        clientRegistrationAttempted = true
+        await core.update { state in
+            state.clientRegistrationAttempted = true
+        }
+
+        var registrationConfiguration = configuration
+        registrationConfiguration.authentication = currentState.authentication
 
         if let (registration, updatedAuth) = try await clientRegistrar.register(
-            configuration: configuration,
+            configuration: registrationConfiguration,
             asMetadata: asMetadata,
             session: session
         ) {
-            configuration.authentication = updatedAuth
-            if let expiresAt = registration.clientSecretExpiresAt, expiresAt > 0 {
-                clientSecretExpiresAt = Date(timeIntervalSince1970: Double(expiresAt))
+            await core.update { state in
+                state.authentication = updatedAuth
+                if let expiresAt = registration.clientSecretExpiresAt, expiresAt > 0 {
+                    state.clientSecretExpiresAt = Date(timeIntervalSince1970: Double(expiresAt))
+                }
             }
         }
     }
@@ -701,8 +1009,9 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
 
     private func storeTokenResponse(
         _ decoded: OAuthTokenResponse,
-        requestedScopes: Set<String>?
-    ) {
+        requestedScopes: Set<String>?,
+        resource: URL
+    ) async {
         let scopeSet: Set<String>
         if let scope = decoded.scope {
             scopeSet = scopeSelector.parseScopeString(scope)
@@ -710,20 +1019,24 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
             scopeSet = requestedScopes ?? []
         }
         let expiresAt = decoded.expiresIn.map { Date().addingTimeInterval(TimeInterval($0)) }
-        tokenStorage.save(OAuthAccessToken(
+        let state = await core.snapshot()
+        await core.saveToken(OAuthAccessToken(
             value: decoded.accessToken,
             tokenType: OAuthTokenType.bearer,
             expiresAt: expiresAt,
             scopes: scopeSet,
-            authorizationServer: selectedAuthorizationServer,
+            resource: resource,
+            authorizationServer: state.selectedAuthorizationServer,
             refreshToken: decoded.refreshToken,
-            clientID: nonEmptyClientID()
+            clientID: nonEmptyClientID(authentication: state.authentication)
         ))
     }
 
     /// Returns the configured `client_id` or `nil` if the authorizer has not yet been assigned one.
-    private func nonEmptyClientID() -> String? {
-        let id = configuration.authentication.clientID
+    private func nonEmptyClientID(
+        authentication: OAuthConfiguration.TokenEndpointAuthentication
+    ) -> String? {
+        let id = authentication.clientID
         return id.isEmpty ? nil : id
     }
 
@@ -751,10 +1064,11 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         return tokenEndpoint
     }
 
-    private func canonicalResource(for endpoint: URL) throws -> URL {
+    private func canonicalResource(for endpoint: URL) async throws -> URL {
         let endpointCanonical = try discoveryClient.metadataDiscovery.canonicalResourceURI(
             from: endpoint)
 
+        let resource: URL
         if let configuredResource = configuration.endpointOverrides.resource {
             let configuredCanonical = try discoveryClient.metadataDiscovery.canonicalResourceURI(
                 from: configuredResource)
@@ -766,10 +1080,8 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
                     actual: configuredCanonical.absoluteString
                 )
             }
-            return configuredCanonical
-        }
-
-        if let prmResourceString = protectedResourceMetadata?.resource,
+            resource = configuredCanonical
+        } else if let prmResourceString = (await core.snapshot().protectedResourceMetadata)?.resource,
             let prmResourceURL = URL(string: prmResourceString)
         {
             let prmCanonical = try discoveryClient.metadataDiscovery.canonicalResourceURI(
@@ -782,30 +1094,15 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
                     actual: prmCanonical.absoluteString
                 )
             }
-            return prmCanonical
+            resource = prmCanonical
+        } else {
+            resource = endpointCanonical
         }
 
-        return endpointCanonical
-    }
-
-    private func authorizationServersMatch(_ lhs: URL, _ rhs: URL) -> Bool {
-        normalizedAuthorizationServer(lhs) == normalizedAuthorizationServer(rhs)
-    }
-
-    private func normalizedAuthorizationServer(_ url: URL) -> URL? {
-        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-            let scheme = components.scheme?.lowercased(),
-            let host = components.host?.lowercased(),
-            scheme == OAuthURLScheme.http || scheme == OAuthURLScheme.https
-        else {
-            return nil
+        await core.update { state in
+            state.selectedResource = resource
         }
-        components.scheme = scheme
-        components.host = host
-        components.query = nil
-        components.fragment = nil
-        if components.path == "/" { components.path = "" }
-        return components.url
+        return resource
     }
 
     // MARK: - External Token Provider
@@ -822,16 +1119,19 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
     private func storeExternalAccessToken(
         _ token: String,
         requestedScopes: Set<String>?,
-        authorizationServer: URL?
-    ) {
-        tokenStorage.save(OAuthAccessToken(
+        authorizationServer: URL?,
+        resource: URL
+    ) async {
+        let authentication = await core.snapshot().authentication
+        await core.saveToken(OAuthAccessToken(
             value: token,
             tokenType: OAuthTokenType.bearer,
             expiresAt: nil,
             scopes: requestedScopes ?? [],
+            resource: resource,
             authorizationServer: authorizationServer,
             refreshToken: nil,
-            clientID: nonEmptyClientID()
+            clientID: nonEmptyClientID(authentication: authentication)
         ))
     }
 
@@ -845,9 +1145,10 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
     ) async throws -> OAuthConfiguration.AccessTokenProviderContext {
         let asMetadata = try await resolveAuthorizationServerMetadata(
             metadata: metadata, session: session)
-        let resource = try canonicalResource(for: endpoint)
+        let resource = try await canonicalResource(for: endpoint)
+        let currentState = await core.snapshot()
         let authorizationServer = configuration.endpointOverrides.authorizationServerURL
-            ?? selectedAuthorizationServer
+            ?? currentState.selectedAuthorizationServer
             ?? metadata.authorizationServers.first
         let tokenEndpoint = configuration.endpointOverrides.tokenEndpoint ?? asMetadata.tokenEndpoint
 
@@ -865,9 +1166,4 @@ public final class OAuthAuthorizer: HTTPClientAuthorizer, @unchecked Sendable {
         )
     }
 
-    private func normalizedOperationKey(_ operationKey: String?) -> String {
-        guard let operationKey else { return "<unknown>" }
-        let normalized = operationKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        return normalized.isEmpty ? "<unknown>" : normalized
-    }
 }

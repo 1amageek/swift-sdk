@@ -77,7 +77,9 @@ public struct DiscoverResult: Hashable, Codable, Sendable {
         } else {
             instructions = nil
         }
-        guard fields["resultType"]?.stringValue == ResultType.complete.rawValue else {
+        if let rawResultType = fields["resultType"],
+            rawResultType.stringValue != ResultType.complete.rawValue
+        {
             throw ProtocolCoreError.invalidResultType
         }
         let cacheHint = try _protocolCoreDecodeValue(

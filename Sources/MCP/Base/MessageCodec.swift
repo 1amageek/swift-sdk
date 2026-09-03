@@ -15,10 +15,12 @@ struct MessageCodec: Sendable {
     }
 
     func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
-        try validateModernWire(data)
-        if !era.isModern, T.self == ResultEnvelope.self {
-            return try JSONDecoder().decode(type, from: legacyResultEnvelopeData(data))
+        if T.self == ResultEnvelope.self {
+            let normalized = try resultEnvelopeData(data)
+            try validateModernWire(normalized)
+            return try JSONDecoder().decode(type, from: normalized)
         }
+        try validateModernWire(data)
         return try JSONDecoder().decode(type, from: data)
     }
 
@@ -30,7 +32,7 @@ struct MessageCodec: Sendable {
         } else {
             result = raw
         }
-        let normalizedResult = era.isModern ? result : materializeLegacyResultType(result)
+        let normalizedResult = materializeDefaultResultType(result)
         if era.isModern {
             try validateModernResult(normalizedResult)
         }
@@ -108,10 +110,15 @@ struct MessageCodec: Sendable {
         guard case .object(let fields) = value else {
             throw ProtocolCoreError.malformedMessage("result must be an object")
         }
-        guard let rawType = fields["resultType"]?.stringValue else {
-            throw ProtocolCoreError.missingResultType
+        let resultType: ResultType
+        if let rawValue = fields["resultType"] {
+            guard let rawType = rawValue.stringValue else {
+                throw ProtocolCoreError.invalidResultType
+            }
+            resultType = ResultType(rawValue: rawType)
+        } else {
+            resultType = .complete
         }
-        let resultType = ResultType(rawValue: rawType)
         if let cacheScope = fields["cacheScope"], fields["ttlMs"] == nil {
             _ = cacheScope
             throw ProtocolCoreError.invalidCacheHint
@@ -154,7 +161,7 @@ struct MessageCodec: Sendable {
         }
     }
 
-    private func materializeLegacyResultType(_ value: Value) -> Value {
+    private func materializeDefaultResultType(_ value: Value) -> Value {
         guard case .object(var fields) = value, fields["resultType"] == nil else {
             return value
         }
@@ -162,14 +169,14 @@ struct MessageCodec: Sendable {
         return .object(fields)
     }
 
-    private func legacyResultEnvelopeData(_ data: Data) throws -> Data {
+    private func resultEnvelopeData(_ data: Data) throws -> Data {
         let raw = try decodeRawValue(from: data)
         let normalized: Value
         if case .object(var fields) = raw, let result = fields["result"] {
-            fields["result"] = materializeLegacyResultType(result)
+            fields["result"] = materializeDefaultResultType(result)
             normalized = .object(fields)
         } else {
-            normalized = materializeLegacyResultType(raw)
+            normalized = materializeDefaultResultType(raw)
         }
         return try JSONEncoder().encode(normalized)
     }

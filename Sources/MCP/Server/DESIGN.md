@@ -17,7 +17,7 @@ returns typed success or failure results. It owns the semantic meaning of modern
 request metadata, input-required results, capability gates, custom tool-header
 and method validation, and subscription acknowledgement/filter state.
 
-Server does not parse standard HTTP headers, mint HTTP exchange IDs, frame bytes,
+Server does not validate the protocol-version HTTP header/body pair, mint HTTP exchange IDs, frame bytes,
 own client UI/input, implement OAuth, persist application data, or implement
 Tasks. Transport supplies normalized delivery/context and status mapping; Base
 supplies wire values and typed errors. For an incoming modern tool call, Server
@@ -68,11 +68,11 @@ separate branches of one actor contract.
 | Legacy lifecycle | Existing `start(transport:)`, initialize/initialized ordering, strict capability checks, cancellation, and `stop()` behavior remain available for legacy peers. |
 | Modern discovery | `server/discover` is always implemented for modern requests and returns supported versions, capabilities, and server metadata through the Base result contract. |
 | Request context | Each handler sees immutable request-scoped metadata and normalized HTTP context, if supplied; context is released after dispatch. |
-| Custom headers and method semantics | Server combines the current request/auth context with the relevant tool schema and Base's `ToolHeaderResolver` to validate schema-derived `Mcp-Param-*` values and method semantics before handler dispatch; Transport only forwards the headers and maps the typed outcome to HTTP status. |
+| Custom headers and method semantics | Server combines the current request/auth context with the relevant tool schema and Base's `ToolHeaderResolver` to validate method/name applicability and schema-derived `Mcp-Param-*` values before handler dispatch. Transport has already validated protocol-version header/body agreement and maps typed outcomes to HTTP status. |
 | Tool-schema lookup | For each modern `tools/call`, Server invokes the registered `tools/list` handler in the current authorization context and follows cursors until the named tool is found or pagination terminates. `Server.Configuration.maxToolSchemaLookupPages` is positive and defaults to `64`; seen cursors are bounded by that limit, cycles and exhaustion are typed failures, and pages, cursors, and schemas are not cached or retained across requests. |
 | Era gates | Modern removed operations return explicit method-not-found behavior; valid Roots, Sampling, Logging, and DCR-related contracts are not removed by an era shortcut. |
 | Capability validation | A method requiring an undeclared client capability returns typed `MissingRequiredClientCapability`; validation happens before application handler invocation. |
-| Result contract | Modern results carry required `resultType`; cache hints and opaque request state are emitted only through the Base models. |
+| Result contract | Modern Server responses emit an explicit `resultType`; Base owns the default-complete decode rule, cache hints, and opaque request state. |
 | MRTR | Each modern POST/request is dispatched independently. Only `tools/call`, `prompts/get`, and `resources/read` may yield supported input-required results. Server forwards `requestState` as an opaque untrusted value to the application handler and does not retain cross-request continuation or tamper state. The Client owns the `maxRounds = 10` loop; application/conformance policy owns state integrity. |
 | Subscription semantics | `subscriptions/listen` registers a bounded subscription, sends acknowledgement first, applies requested filters, and removes state on cancel, terminal result, disconnect, or shutdown. Shutdown does not wait for the peer to consume a buffered acknowledgement. |
 | Resource limit | `maxSubscriptions` is positive and defaults to `1024`; overflow is a typed failure, not an unbounded dictionary growth path. |

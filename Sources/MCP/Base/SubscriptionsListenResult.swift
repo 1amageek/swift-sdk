@@ -23,7 +23,9 @@ public struct SubscriptionsListenResult: Hashable, Codable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let fields = try _protocolCoreDecodeObject(from: decoder, as: "subscription result")
-        guard fields["resultType"]?.stringValue == ResultType.complete.rawValue else {
+        if let rawResultType = fields["resultType"],
+            rawResultType.stringValue != ResultType.complete.rawValue
+        {
             throw ProtocolCoreError.invalidResultType
         }
         guard let rawMetadata = fields["_meta"],

@@ -18,6 +18,8 @@ Parent: none.
 Children:
 
 - [MCP module](Sources/MCP/DESIGN.md)
+- [Client conformance adapter](Sources/MCPConformance/Client/DESIGN.md)
+- [Server conformance adapter](Sources/MCPConformance/Server/DESIGN.md)
 
 ## Responsibilities and Boundaries
 
@@ -50,7 +52,8 @@ and do not become a second protocol implementation.
 | [Authorization](Sources/MCP/Base/Authorization/DESIGN.md) | child of Base | OAuth discovery, validation, token, and registration client policy | it does not implement an authorization server |
 | [Client](Sources/MCP/Client/DESIGN.md) | child of the module | connection negotiation, pending requests, MRTR, and subscriptions | no concrete transport downcast or persistence |
 | [Server](Sources/MCP/Server/DESIGN.md) | child of the module | handler dispatch, discovery, request context, MRTR validation, and subscription semantics | no HTTP parsing or client UI |
-| Conformance executables | package test adapters | pinned scored invocation through public APIs | adapter code does not become a second protocol implementation |
+| [Client conformance adapter](Sources/MCPConformance/Client/DESIGN.md) | child executable target | frozen scenario dispatch through public Client APIs | no protocol behavior or success fallback in the adapter |
+| [Server conformance adapter](Sources/MCPConformance/Server/DESIGN.md) | child executable target | frozen fixture handlers over public Server/Transport APIs | HTTP framework code translates only at the boundary |
 
 ## Architecture
 
@@ -91,7 +94,7 @@ workflow around a tool call.
 | Public transport | `Transport.send(Data)` / `receive()` remain unchanged | explicit byte-stream delivery uses the raw path; explicit HTTP delivery uses a package-internal request-header capability without a concrete downcast |
 | HTTP lifecycle | existing session, GET/SSE, DELETE, and replay behavior remain available to legacy peers | every request is a new POST exchange; no session, GET stream, `Last-Event-ID`, or replay |
 | Stdio lifecycle | one live connection and initialize state | one live channel; modern discovery/fallback probing never opens a second connection |
-| Metadata | existing legacy fields and tolerant decoding | request `_meta` is request-scoped, result `resultType` is required, and cache hints are preserved as data |
+| Metadata | existing legacy fields and tolerant decoding | request `_meta` is request-scoped; absent result `resultType` defaults to `complete`, explicit `input_required` remains distinct, and cache hints are preserved as data |
 | Removed operations | existing legacy operations remain available where supported | removed operations are era-gated; valid Roots, Sampling, Logging, and DCR contracts are not removed merely because their old lifecycle changed |
 
 The exact era rules and public/internal API ownership are detailed in the child
@@ -110,6 +113,7 @@ designs; this table is the package-wide compatibility invariant.
 | paginated tool discovery | the transient client resolution operation | `maxToolListPages` is positive and defaults to `64`; cursor cycles and bound exhaustion are failures |
 | server tool-schema lookup | the current `Server` request dispatch | `Server.Configuration.maxToolSchemaLookupPages` is positive and defaults to `64`; lookup uses the current authorization context, bounds seen cursors, and reports cursor cycles or page exhaustion as typed failures |
 | subscriptions | server configuration and registry | `maxSubscriptions` is positive and defaults to `1024`; overflow is a typed failure |
+| OAuth retry counters | current HTTP logical request | authorization and scope-upgrade counters are finite and released on every terminal path; no method/scope-keyed state survives the request |
 
 All new validation and failure paths are explicit. They do not convert malformed
 messages, unsupported capabilities, or closed streams into successful empty
@@ -195,7 +199,7 @@ boundary owns the focused behavioral test and the pinned conformance run.
 | `input-required-result-multi-round` | Server | bounded multi-round state-machine test |
 | `input-required-result-missing-input-response` | Server | missing-input response validation test |
 | `input-required-result-non-tool-request` | Server | prompts/get and resources/read MRTR method-gate test |
-| `input-required-result-result-type` | Base protocol core | required modern result type test |
+| `input-required-result-result-type` | Base protocol core | explicit input-required discriminator test |
 | `input-required-result-unsupported-methods` | Server | unsupported input method rejection test |
 | `input-required-result-tampered-state` | Server | opaque-state forwarding test with integrity policy in the application/conformance fixture |
 | `input-required-result-capability-check` | Server | client capability gate test |
@@ -229,11 +233,11 @@ The table contains all 37 server IDs from the frozen file.
 | `auth/offline-access-not-supported` | Authorization | unsupported offline scope omission test |
 | `auth/authorization-server-migration` | Authorization | issuer migration test |
 | `auth/iss-supported` | Authorization | RFC 9207 issuer acceptance test |
-| `auth/iss-not-advertised` | Authorization | missing advertised issuer test |
+| `auth/iss-not-advertised` | Authorization | absent issuer acceptance when support is not advertised test |
 | `auth/iss-supported-missing` | Authorization | required issuer absence test |
 | `auth/iss-wrong-issuer` | Authorization | wrong issuer rejection test |
 | `auth/iss-unexpected` | Authorization | unexpected issuer rejection test |
-| `auth/iss-normalized` | Authorization | normalized issuer comparison test |
+| `auth/iss-normalized` | Authorization | exact-string rejection of a normalization-only issuer match test |
 | `auth/metadata-issuer-mismatch` | Authorization | metadata issuer mismatch rejection test |
 | `sep-2322-client-request-state` | Client | Base protocol core plus opaque client request-state echo test |
 | `http-standard-headers` | Transport | Client request plus standard header derivation/wire test |

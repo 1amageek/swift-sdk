@@ -32,6 +32,7 @@ public enum MCPError: Swift.Error, Sendable {
     case invalidRequest(String?)  // -32600
     case methodNotFound(String?)  // -32601
     case invalidParams(String?)  // -32602
+    case resourceNotFound(uri: String)  // -32602
     case internalError(String?)  // -32603
 
     // Server errors (-32000 to -32099)
@@ -55,7 +56,7 @@ public enum MCPError: Swift.Error, Sendable {
         case .parseError: return -32700
         case .invalidRequest: return -32600
         case .methodNotFound: return -32601
-        case .invalidParams: return -32602
+        case .invalidParams, .resourceNotFound: return -32602
         case .internalError: return -32603
         case .serverError(let code, _): return code
         case .urlElicitationRequired: return -32042
@@ -97,6 +98,8 @@ extension MCPError: LocalizedError {
             return "Method not found" + (detail.map { ": \($0)" } ?? "")
         case .invalidParams(let detail):
             return "Invalid params" + (detail.map { ": \($0)" } ?? "")
+        case .resourceNotFound(let uri):
+            return "Resource not found: \(uri)"
         case .internalError(let detail):
             return "Internal error" + (detail.map { ": \($0)" } ?? "")
         case .serverError(_, let message):
@@ -128,7 +131,7 @@ extension MCPError: LocalizedError {
             return "The JSON sent is not a valid Request object"
         case .methodNotFound:
             return "The method does not exist or is not available"
-        case .invalidParams:
+        case .invalidParams, .resourceNotFound:
             return "Invalid method parameter(s)"
         case .internalError:
             return "Internal JSON-RPC error"
@@ -163,6 +166,8 @@ extension MCPError: LocalizedError {
             return "Check the method name and ensure it is supported by the server"
         case .invalidParams:
             return "Verify the parameters match the method's expected parameters"
+        case .resourceNotFound:
+            return "Verify the requested resource URI"
         case .urlElicitationRequired(_, let elicitations):
             if let first = elicitations.first {
                 return "Visit \(first.url) to complete the required authentication or input"
@@ -216,6 +221,9 @@ extension MCPError: Codable {
             if let detail = detail {
                 try container.encode(["detail": detail], forKey: .data)
             }
+        case .resourceNotFound(let uri):
+            try container.encode(errorDescription ?? "Resource not found", forKey: .message)
+            try container.encode(["uri": Value.string(uri)], forKey: .data)
         case .serverError(_, _):
             // No additional data for server errors
             try container.encode(errorDescription ?? "Unknown error", forKey: .message)
@@ -306,7 +314,16 @@ extension MCPError: Codable {
         case -32601:
             self = .methodNotFound(unwrapDetail(message))
         case -32602:
-            self = .invalidParams(unwrapDetail(message))
+            if let rawURI = data?["uri"] {
+                guard let uri = rawURI.stringValue else {
+                    throw invalidStructuredData(
+                        "Invalid uri for resource-not-found error code -32602"
+                    )
+                }
+                self = .resourceNotFound(uri: uri)
+            } else {
+                self = .invalidParams(unwrapDetail(message))
+            }
         case -32603:
             self = .internalError(unwrapDetail(nil))
         case -32042:
@@ -406,6 +423,7 @@ extension MCPError: Equatable {
         case (.invalidRequest(let a), .invalidRequest(let b)): return a == b
         case (.methodNotFound(let a), .methodNotFound(let b)): return a == b
         case (.invalidParams(let a), .invalidParams(let b)): return a == b
+        case (.resourceNotFound(let a), .resourceNotFound(let b)): return a == b
         case (.internalError(let a), .internalError(let b)): return a == b
         case (.serverError(let c1, let m1), .serverError(let c2, let m2)):
             return c1 == c2 && m1 == m2
@@ -449,6 +467,8 @@ extension MCPError: Hashable {
             hasher.combine(detail)
         case .invalidParams(let detail):
             hasher.combine(detail)
+        case .resourceNotFound(let uri):
+            hasher.combine(uri)
         case .internalError(let detail):
             hasher.combine(detail)
         case .serverError(_, let message):

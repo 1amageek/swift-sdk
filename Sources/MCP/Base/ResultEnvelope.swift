@@ -24,10 +24,15 @@ public struct ResultEnvelope: Hashable, Codable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let rawFields = try _protocolCoreDecodeObject(from: decoder, as: "result")
-        guard let rawType = rawFields["resultType"]?.stringValue else {
-            throw ProtocolCoreError.missingResultType
+        let resultType: ResultType
+        if let rawValue = rawFields["resultType"] {
+            guard let rawType = rawValue.stringValue else {
+                throw ProtocolCoreError.invalidResultType
+            }
+            resultType = ResultType(rawValue: rawType)
+        } else {
+            resultType = .complete
         }
-        let resultType = ResultType(rawValue: rawType)
         try _protocolCoreValidateResultTypeCombination(resultType, fields: rawFields)
 
         let metadata: ResultMetadata?

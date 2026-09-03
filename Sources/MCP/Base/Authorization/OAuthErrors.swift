@@ -15,6 +15,9 @@ public enum OAuthAuthorizationError: LocalizedError {
     /// All Authorization Server Metadata discovery candidates (RFC 8414 / OIDC) returned errors.
     case authorizationServerMetadataDiscoveryFailed
 
+    /// Authorization Server Metadata omitted its required `issuer` identifier.
+    case authorizationServerMetadataMissingIssuer
+
     /// The authorization server metadata does not include a `token_endpoint`.
     case tokenEndpointMissing
 
@@ -109,6 +112,10 @@ public enum OAuthAuthorizationError: LocalizedError {
     /// The authorization response redirect URL is missing the `code` parameter.
     case authorizationResponseMissingCode
 
+    /// The authorization server requires an issuer response parameter, but the redirect
+    /// response did not include one.
+    case authorizationResponseMissingIssuer
+
     /// The authorization server metadata does not include `code_challenge_methods_supported`,
     /// which is required for PKCE (RFC 7636).
     case pkceCodeChallengeMethodsMissing
@@ -139,6 +146,8 @@ public enum OAuthAuthorizationError: LocalizedError {
             return "Failed to discover protected resource metadata"
         case .authorizationServerMetadataDiscoveryFailed:
             return "Failed to discover authorization server metadata"
+        case .authorizationServerMetadataMissingIssuer:
+            return "Authorization server metadata is missing issuer"
         case .tokenEndpointMissing:
             return "Authorization server metadata is missing token_endpoint"
         case .tokenRequestFailed(let statusCode, let oauthError):
@@ -185,6 +194,8 @@ public enum OAuthAuthorizationError: LocalizedError {
             return "Authorization response state mismatch. Expected \(expected), got \(actual)"
         case .authorizationResponseMissingCode:
             return "Authorization response is missing the authorization code"
+        case .authorizationResponseMissingIssuer:
+            return "Authorization response is missing issuer"
         case .pkceCodeChallengeMethodsMissing:
             return
                 "Authorization server metadata must include code_challenge_methods_supported for PKCE"

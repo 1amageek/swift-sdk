@@ -102,7 +102,8 @@ use `Transport.send(Data)`.
 | --- | --- |
 | Public raw transport | `Transport: Actor` retains `logger`, `connect()`, `disconnect()`, `send(Data)`, and `receive() -> AsyncThrowingStream<Data, Error>`. Existing custom transports continue to compile and behave as raw byte channels. |
 | Client HTTP request capability | The package-internal HTTP capability applies Client-derived headers to one request and updates the selected protocol-version header. It owns HTTP construction/auth/retry/SSE only and never inspects method or schema meaning. |
-| Modern HTTP admission | Each request is a new POST. The transport validates HTTP/body syntax, safely normalizes standard header names and OWS, validates the modern protocol version and Origin before delivery, mints an `ExchangeID`, and maps typed boundary failures to HTTP status. Server owns header/body meaning, header applicability, tool-schema custom-header, and method-semantic validation. |
+| Authorization retry ownership | Each HTTP logical request owns finite authorization and scope-upgrade counters. The counters are released by stack lifetime on success, failure, or cancellation and never persist in the authorizer or across later requests. |
+| Modern HTTP admission | Each request is a new POST. The transport validates HTTP/body syntax, safely normalizes standard header names and OWS, validates the protocol-version header and its exact agreement with request `_meta` before Base decoding, preserves the request ID and structured error data on admission failure, validates Origin, mints an `ExchangeID`, and maps typed boundary failures to HTTP status. Server owns method/name header applicability, tool-schema custom-header, and method-semantic validation. |
 | Modern HTTP lifecycle | No modern session ID, GET subscription endpoint, `Last-Event-ID`, replay, or DELETE lifecycle is used. A per-request JSON or SSE result ends with that exchange. |
 | Legacy HTTP compatibility | Existing stateful initialize/session/GET-SSE/DELETE/replay paths remain available for legacy peers and are not selected for modern requests. |
 | Exchange identity | `ExchangeID` is unique for the lifetime of one admitted POST and is independent of the JSON-RPC `ID`. Equal JSON-RPC IDs in concurrent POSTs cannot share a waiter, context, response, notification, or cancellation. |
@@ -154,6 +155,7 @@ sequenceDiagram
 | modern exchange record | HTTP server transport | POST admission through terminal response/cancel/disconnect |
 | incoming stream continuation | concrete transport | connect through disconnect/shutdown |
 | authorizer reference | HTTP client transport | transport lifetime; OAuth state remains in Authorization/TokenStorage |
+| authorization retry counters | current HTTP logical request | first send through success, failure, or cancellation; no cross-request retention |
 
 The exchange record is not a server session and is not retained after terminal
 cleanup. Notifications or server-initiated requests that have no valid modern
@@ -164,8 +166,9 @@ are not silently delivered to another exchange.
 
 - HTTP validation runs before the body enters server dispatch. Unsafe standard
   header values and unsupported versions fail before delivery; unsupported
-  versions are `400` with typed `UnsupportedProtocolVersion`, and invalid
-  Origin is `403`. Server's typed header/body mismatch is mapped to modern HTTP
+  versions are `400` with typed `UnsupportedProtocolVersion`, original request
+  ID, and `requested`/`supported` data. A protocol-version header/body mismatch
+  is `400` with `HeaderMismatch`, and invalid Origin is `403`. Server's typed header mismatch is mapped to modern HTTP
   `400` with `-32020`, and its typed method-not-found result is mapped to
   modern HTTP `404` with `-32601`; Transport does not decide method semantics.
 - A cancelled or disconnected exchange resumes its waiter with a typed failure,
@@ -175,6 +178,9 @@ are not silently delivered to another exchange.
   terminal delivery never makes shutdown wait for an inactive consumer.
 - Transport does not perform unbounded response buffering, cursor traversal, or
   schema walking. Higher-layer limits are enforced by their owners.
+- Authentication retries and `403 insufficient_scope` upgrades are bounded by
+  request-local counters. A later request starts with fresh counters even when
+  its JSON-RPC method and challenged scope equal an earlier request.
 
 ## Verification and Change Impact
 
@@ -187,6 +193,6 @@ header derivation/validation and unknown-method behavior are verified by the
 Client/Server owners. Existing legacy HTTP and network tests remain a separate
 regression class.
 
-Changes to exchange identity, HTTP status/error mapping, stream lifecycle, or
-raw method signatures require rechecking Base, Client, Server, and the package
-master.
+Changes to exchange identity, HTTP status/error mapping, authorization retry
+lifetime, stream lifecycle, or raw method signatures require rechecking Base,
+Client, Server, Authorization, and the package master.

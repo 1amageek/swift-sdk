@@ -77,6 +77,30 @@ struct OAuthAuthorizationServerMetadata: Decodable, Sendable, Equatable {
     let codeChallengeMethodsSupported: [String]?
     let tokenEndpointAuthMethodsSupported: [String]?
     let clientIDMetadataDocumentSupported: Bool?
+    let scopesSupported: [String]?
+    let authorizationResponseIssParameterSupported: Bool?
+
+    init(
+        issuer: URL?,
+        authorizationEndpoint: URL?,
+        tokenEndpoint: URL?,
+        registrationEndpoint: URL?,
+        codeChallengeMethodsSupported: [String]?,
+        tokenEndpointAuthMethodsSupported: [String]?,
+        clientIDMetadataDocumentSupported: Bool?,
+        scopesSupported: [String]? = nil,
+        authorizationResponseIssParameterSupported: Bool? = nil
+    ) {
+        self.issuer = issuer
+        self.authorizationEndpoint = authorizationEndpoint
+        self.tokenEndpoint = tokenEndpoint
+        self.registrationEndpoint = registrationEndpoint
+        self.codeChallengeMethodsSupported = codeChallengeMethodsSupported
+        self.tokenEndpointAuthMethodsSupported = tokenEndpointAuthMethodsSupported
+        self.clientIDMetadataDocumentSupported = clientIDMetadataDocumentSupported
+        self.scopesSupported = scopesSupported
+        self.authorizationResponseIssParameterSupported = authorizationResponseIssParameterSupported
+    }
 
     enum CodingKeys: String, CodingKey {
         case issuer
@@ -86,6 +110,8 @@ struct OAuthAuthorizationServerMetadata: Decodable, Sendable, Equatable {
         case codeChallengeMethodsSupported = "code_challenge_methods_supported"
         case tokenEndpointAuthMethodsSupported = "token_endpoint_auth_methods_supported"
         case clientIDMetadataDocumentSupported = "client_id_metadata_document_supported"
+        case scopesSupported = "scopes_supported"
+        case authorizationResponseIssParameterSupported = "authorization_response_iss_parameter_supported"
     }
 }
 
@@ -126,6 +152,9 @@ public struct OAuthAccessToken: Sendable, Codable {
     /// The set of OAuth scopes granted with this token.
     public let scopes: Set<String>
 
+    /// The canonical RFC 8707 resource indicator for which this token was issued.
+    public let resource: URL?
+
     /// The issuer URL of the authorization server that issued this token.
     ///
     /// Used to detect when the active authorization server changes between requests,
@@ -149,6 +178,7 @@ public struct OAuthAccessToken: Sendable, Codable {
         tokenType: String,
         expiresAt: Date?,
         scopes: Set<String>,
+        resource: URL? = nil,
         authorizationServer: URL?,
         refreshToken: String?,
         clientID: String? = nil
@@ -157,6 +187,7 @@ public struct OAuthAccessToken: Sendable, Codable {
         self.tokenType = tokenType
         self.expiresAt = expiresAt
         self.scopes = scopes
+        self.resource = resource
         self.authorizationServer = authorizationServer
         self.refreshToken = refreshToken
         self.clientID = clientID
