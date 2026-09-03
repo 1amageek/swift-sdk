@@ -104,7 +104,7 @@ use `Transport.send(Data)`.
 | Contract | Guarantee |
 | --- | --- |
 | Public raw transport | `Transport: Actor` retains `logger`, `connect()`, `disconnect()`, `send(Data)`, and `receive() -> AsyncThrowingStream<Data, Error>`. Existing custom transports continue to compile and behave as raw byte channels. |
-| Client HTTP request capability | The package-internal HTTP capability applies Client-derived headers to one request, updates the selected protocol-version header, and validates direct or SSE response IDs against that request before forwarding. It owns HTTP construction/auth/retry/SSE only and never inspects method or schema meaning. |
+| Client HTTP request capability | The package-internal HTTP capability applies Client-derived headers to one request, updates the selected protocol-version header, and validates each supported direct or SSE response against that request before forwarding. Linux retains the existing explicit SSE limitation because FoundationNetworking does not expose asynchronous response bytes; it never substitutes unbounded buffering. It owns HTTP construction/auth/retry/SSE only and never inspects method or schema meaning. |
 | Authorization retry ownership | Each HTTP logical request owns finite authorization and scope-upgrade counters. The counters are released by stack lifetime on success, failure, or cancellation and never persist in the authorizer or across later requests. |
 | Modern HTTP admission | Each request is a new POST. The transport validates HTTP/body syntax, treats only an absent `id` member as a notification, requires a present request ID to be a string or integer, safely normalizes standard header names and OWS, validates the protocol-version header and its exact agreement with request `_meta` before Base decoding, preserves the request ID and structured error data on admission failure, validates Origin, mints an `ExchangeID`, and maps typed boundary failures to HTTP status. Server owns method/name header applicability, tool-schema custom-header, and method-semantic validation. |
 | Modern HTTP lifecycle | No modern session ID, GET subscription endpoint, `Last-Event-ID`, replay, or DELETE lifecycle is used. A per-request JSON or SSE result ends with that exchange. |
@@ -180,9 +180,10 @@ are not silently delivered to another exchange.
 - A malformed modern response or an ID that differs from the originating POST
   fails that request's delivery task before global message delivery. Other
   in-flight requests remain pending and cannot consume that response.
-- Modern SSE is per request and non-resumable. Legacy resumability remains only
-  on the legacy branch. Non-terminal producers apply bounded backpressure;
-  terminal delivery never makes shutdown wait for an inactive consumer.
+- On supported platforms, modern SSE is per request and non-resumable. Legacy
+  resumability remains only on the legacy branch. Non-terminal producers apply
+  bounded backpressure; terminal delivery never makes shutdown wait for an
+  inactive consumer. Linux rejects SSE responses explicitly.
 - Transport does not perform unbounded response buffering, cursor traversal, or
   schema walking. Higher-layer limits are enforced by their owners.
 - Authentication retries and `403 insufficient_scope` upgrades are bounded by
