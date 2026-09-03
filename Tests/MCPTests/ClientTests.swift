@@ -5,6 +5,25 @@ import Testing
 
 @Suite("Client Tests", .timeLimit(.minutes(1)))
 struct ClientTests {
+    @discardableResult
+    private func connectWithMockServer(
+        _ client: Client,
+        transport: MockTransport
+    ) async throws -> Initialize.Result {
+        let responseTask = Task {
+            try await transport.queueInitializeResponse()
+        }
+
+        do {
+            let result = try await client.connect(transport: transport)
+            try await responseTask.value
+            return result
+        } catch {
+            responseTask.cancel()
+            throw error
+        }
+    }
+
     @Test("Client connect and disconnect")
     func testClientConnectAndDisconnect() async throws {
         let transport = MockTransport()
@@ -12,32 +31,11 @@ struct ClientTests {
 
         #expect(await transport.isConnected == false)
 
-        // Set up a task to handle the initialize response
-        let initTask = Task {
-            try await Task.sleep(for: .milliseconds(10))
-            if let lastMessage = await transport.sentMessages.last,
-                let data = lastMessage.data(using: .utf8),
-                let request = try? JSONDecoder().decode(Request<Initialize>.self, from: data)
-            {
-                let response = Initialize.response(
-                    id: request.id,
-                    result: .init(
-                        protocolVersion: Version.latest,
-                        capabilities: .init(),
-                        serverInfo: .init(name: "TestServer", version: "1.0"),
-                        instructions: nil
-                    )
-                )
-                try await transport.queue(response: response)
-            }
-        }
-
-        let result = try await client.connect(transport: transport)
+        let result = try await connectWithMockServer(client, transport: transport)
         #expect(await transport.isConnected == true)
         #expect(result.protocolVersion == Version.latest)
         await client.disconnect()
         #expect(await transport.isConnected == false)
-        initTask.cancel()
     }
 
     @Test(
@@ -48,53 +46,22 @@ struct ClientTests {
         let transport = MockTransport()
         let client = Client(name: "TestClient", version: "1.0")
 
-        // Queue a response for the initialize request
-        try await Task.sleep(for: .milliseconds(10))  // Wait for request to be sent
+        let result = try await connectWithMockServer(client, transport: transport)
+        #expect(result.protocolVersion == Version.latest)
+        #expect(result.serverInfo.name == "TestServer")
+        #expect(result.serverInfo.version == "1.0")
 
-        if let lastMessage = await transport.sentMessages.last,
-            let data = lastMessage.data(using: .utf8),
-            let request = try? JSONDecoder().decode(Request<Initialize>.self, from: data)
-        {
-            // Create a valid initialize response
-            let response = Initialize.response(
-                id: request.id,
-                result: .init(
-                    protocolVersion: Version.latest,
-                    capabilities: .init(),
-                    serverInfo: .init(name: "TestServer", version: "1.0"),
-                    instructions: nil
-                )
-            )
-
-            try await transport.queue(response: response)
-
-            // Now complete the connect call which will automatically initialize
-            let result = try await client.connect(transport: transport)
-            #expect(result.protocolVersion == Version.latest)
-            #expect(result.serverInfo.name == "TestServer")
-            #expect(result.serverInfo.version == "1.0")
-
-            // Small delay to ensure message loop is started
-            try await Task.sleep(for: .milliseconds(10))
-
-            // Create a task for the ping
-            let pingTask = Task {
-                try await client.ping()
-            }
-
-            // Give it a moment to send the request
-            try await Task.sleep(for: .milliseconds(10))
-
-            #expect(await transport.sentMessages.count == 2)  // Initialize + Ping
-            #expect(await transport.sentMessages.last?.contains(Ping.name) == true)
-
-            // Cancel the ping task
-            pingTask.cancel()
+        let pingTask = Task {
+            try await client.ping()
         }
 
-        // Disconnect client to clean up message loop and give time for continuation cleanup
+        let pingData = try await transport.waitForSentData(at: 2)
+        let pingRequest = try JSONDecoder().decode(Request<Ping>.self, from: pingData)
+        #expect(pingRequest.method == Ping.name)
+        pingTask.cancel()
+
         await client.disconnect()
-        try await Task.sleep(for: .milliseconds(50))
+        _ = await pingTask.result
     }
 
     @Test("Connection failure handling")
@@ -122,30 +89,7 @@ struct ClientTests {
         let transport = MockTransport()
         let client = Client(name: "TestClient", version: "1.0")
 
-        // Set up a task to handle the initialize response
-        let initTask = Task {
-            try await Task.sleep(for: .milliseconds(10))
-            if let lastMessage = await transport.sentMessages.last,
-                let data = lastMessage.data(using: .utf8),
-                let request = try? JSONDecoder().decode(Request<Initialize>.self, from: data)
-            {
-                let response = Initialize.response(
-                    id: request.id,
-                    result: .init(
-                        protocolVersion: Version.latest,
-                        capabilities: .init(),
-                        serverInfo: .init(name: "TestServer", version: "1.0"),
-                        instructions: nil
-                    )
-                )
-                try await transport.queue(response: response)
-            }
-        }
-
-        // Connect first without failure
-        try await client.connect(transport: transport)
-        try await Task.sleep(for: .milliseconds(10))
-        initTask.cancel()
+        try await connectWithMockServer(client, transport: transport)
 
         // Now set the transport to fail sends
         await transport.setFailSend(true)
@@ -172,54 +116,22 @@ struct ClientTests {
         let config = Client.Configuration.strict
         let client = Client(name: "TestClient", version: "1.0", configuration: config)
 
-        // Set up a task to handle the initialize response
-        let initTask = Task {
-            try await Task.sleep(for: .milliseconds(10))
-            if let lastMessage = await transport.sentMessages.last,
-                let data = lastMessage.data(using: .utf8),
-                let request = try? JSONDecoder().decode(Request<Initialize>.self, from: data)
-            {
-                let response = Initialize.response(
-                    id: request.id,
-                    result: .init(
-                        protocolVersion: Version.latest,
-                        capabilities: .init(),
-                        serverInfo: .init(name: "TestServer", version: "1.0"),
-                        instructions: nil
-                    )
-                )
-                try await transport.queue(response: response)
+        try await connectWithMockServer(client, transport: transport)
+
+        do {
+            _ = try await client.listPrompts()
+            #expect(Bool(false), "Expected listPrompts to fail in strict mode")
+        } catch let error as MCPError {
+            if case MCPError.methodNotFound = error {
+                #expect(Bool(true))
+            } else {
+                #expect(Bool(false), "Expected methodNotFound error, got \(error)")
             }
+        } catch {
+            #expect(Bool(false), "Expected MCP.Error")
         }
 
-        try await client.connect(transport: transport)
-
-        // Create a task for listPrompts
-        let promptsTask = Task<Void, Swift.Error> {
-            do {
-                _ = try await client.listPrompts()
-                #expect(Bool(false), "Expected listPrompts to fail in strict mode")
-            } catch let error as MCPError {
-                if case MCPError.methodNotFound = error {
-                    #expect(Bool(true))
-                } else {
-                    #expect(Bool(false), "Expected methodNotFound error, got \(error)")
-                }
-            } catch {
-                #expect(Bool(false), "Expected MCP.Error")
-            }
-        }
-
-        // Give it a short time to execute the task
-        try await Task.sleep(for: .milliseconds(50))
-
-        // Cancel the task if it's still running
-        promptsTask.cancel()
-        initTask.cancel()
-
-        // Disconnect client
         await client.disconnect()
-        try await Task.sleep(for: .milliseconds(50))
     }
 
     @Test("Non-strict configuration - capabilities check")
@@ -228,89 +140,33 @@ struct ClientTests {
         let config = Client.Configuration.default
         let client = Client(name: "TestClient", version: "1.0", configuration: config)
 
-        // Set up a task to handle the initialize response
-        let initTask = Task {
-            try await Task.sleep(for: .milliseconds(10))
-            if let lastMessage = await transport.sentMessages.last,
-                let data = lastMessage.data(using: .utf8),
-                let request = try? JSONDecoder().decode(Request<Initialize>.self, from: data)
-            {
-                let response = Initialize.response(
-                    id: request.id,
-                    result: .init(
-                        protocolVersion: Version.latest,
-                        capabilities: .init(),
-                        serverInfo: .init(name: "TestServer", version: "1.0"),
-                        instructions: nil
-                    )
-                )
-                try await transport.queue(response: response)
-            }
-        }
+        try await connectWithMockServer(client, transport: transport)
 
-        try await client.connect(transport: transport)
-
-        // Make sure init task is complete
-        initTask.cancel()
-
-        // Wait a bit for any setup to complete
-        try await Task.sleep(for: .milliseconds(10))
-
-        // Send the listPrompts request and immediately provide an error response
         let promptsTask = Task {
-            do {
-                // Start the request
-                try await Task.sleep(for: .seconds(1))
+            try await client.listPrompts()
+        }
 
-                // Get the last sent message and extract the request ID
-                if let lastMessage = await transport.sentMessages.last,
-                    let data = lastMessage.data(using: .utf8),
-                    let decodedRequest = try? JSONDecoder().decode(
-                        Request<ListPrompts>.self, from: data)
-                {
+        let requestData = try await transport.waitForSentData(at: 2)
+        let request = try JSONDecoder().decode(Request<ListPrompts>.self, from: requestData)
+        let errorResponse = Response<ListPrompts>(
+            id: request.id,
+            error: MCPError.methodNotFound("Test: Prompts capability not available")
+        )
+        try await transport.queue(response: errorResponse)
 
-                    // Create an error response with the same ID
-                    let errorResponse = Response<ListPrompts>(
-                        id: decodedRequest.id,
-                        error: MCPError.methodNotFound("Test: Prompts capability not available")
-                    )
-                    try await transport.queue(response: errorResponse)
-
-                    // Try the request now that we have a response queued
-                    do {
-                        _ = try await client.listPrompts()
-                        #expect(Bool(false), "Expected listPrompts to fail in non-strict mode")
-                    } catch let error as MCPError {
-                        if case MCPError.methodNotFound = error {
-                            #expect(Bool(true))
-                        } else {
-                            #expect(Bool(false), "Expected methodNotFound error, got \(error)")
-                        }
-                    } catch {
-                        #expect(Bool(false), "Expected MCP.Error")
-                    }
-                }
-            } catch {
-                // Ignore task cancellation
-                if !(error is CancellationError) {
-                    throw error
-                }
+        do {
+            _ = try await promptsTask.value
+            #expect(Bool(false), "Expected listPrompts to fail in non-strict mode")
+        } catch let error as MCPError {
+            if case MCPError.methodNotFound = error {
+                #expect(Bool(true))
+            } else {
+                #expect(Bool(false), "Expected methodNotFound error, got \(error)")
             }
+        } catch {
+            #expect(Bool(false), "Expected MCP.Error")
         }
 
-        // Wait for the task to complete or timeout
-        let timeoutTask = Task {
-            try await Task.sleep(for: .milliseconds(500))
-            promptsTask.cancel()
-        }
-
-        // Wait for the task to complete
-        _ = await promptsTask.result
-
-        // Cancel the timeout task
-        timeoutTask.cancel()
-
-        // Disconnect client
         await client.disconnect()
     }
 
@@ -319,29 +175,7 @@ struct ClientTests {
         let transport = MockTransport()
         let client = Client(name: "TestClient", version: "1.0")
 
-        // Set up a task to handle the initialize response
-        let initTask = Task {
-            try await Task.sleep(for: .milliseconds(10))
-            if let lastMessage = await transport.sentMessages.last,
-                let data = lastMessage.data(using: .utf8),
-                let request = try? JSONDecoder().decode(Request<Initialize>.self, from: data)
-            {
-                let response = Initialize.response(
-                    id: request.id,
-                    result: .init(
-                        protocolVersion: Version.latest,
-                        capabilities: .init(),
-                        serverInfo: .init(name: "TestServer", version: "1.0"),
-                        instructions: nil
-                    )
-                )
-                try await transport.queue(response: response)
-            }
-        }
-
-        try await client.connect(transport: transport)
-        try await Task.sleep(for: .milliseconds(10))  // Allow connection tasks
-        initTask.cancel()
+        try await connectWithMockServer(client, transport: transport)
 
         let request1 = Ping.request()
         let request2 = Ping.request()
@@ -399,29 +233,7 @@ struct ClientTests {
         let transport = MockTransport()
         let client = Client(name: "TestClient", version: "1.0")
 
-        // Set up a task to handle the initialize response
-        let initTask = Task {
-            try await Task.sleep(for: .milliseconds(10))
-            if let lastMessage = await transport.sentMessages.last,
-                let data = lastMessage.data(using: .utf8),
-                let request = try? JSONDecoder().decode(Request<Initialize>.self, from: data)
-            {
-                let response = Initialize.response(
-                    id: request.id,
-                    result: .init(
-                        protocolVersion: Version.latest,
-                        capabilities: .init(),
-                        serverInfo: .init(name: "TestServer", version: "1.0"),
-                        instructions: nil
-                    )
-                )
-                try await transport.queue(response: response)
-            }
-        }
-
-        try await client.connect(transport: transport)
-        try await Task.sleep(for: .milliseconds(10))
-        initTask.cancel()
+        try await connectWithMockServer(client, transport: transport)
 
         let request1 = Ping.request()  // Success
         let request2 = Ping.request()  // Error
@@ -479,29 +291,7 @@ struct ClientTests {
         let transport = MockTransport()
         let client = Client(name: "TestClient", version: "1.0")
 
-        // Set up a task to handle the initialize response
-        let initTask = Task {
-            try await Task.sleep(for: .milliseconds(10))
-            if let lastMessage = await transport.sentMessages.last,
-                let data = lastMessage.data(using: .utf8),
-                let request = try? JSONDecoder().decode(Request<Initialize>.self, from: data)
-            {
-                let response = Initialize.response(
-                    id: request.id,
-                    result: .init(
-                        protocolVersion: Version.latest,
-                        capabilities: .init(),
-                        serverInfo: .init(name: "TestServer", version: "1.0"),
-                        instructions: nil
-                    )
-                )
-                try await transport.queue(response: response)
-            }
-        }
-
-        try await client.connect(transport: transport)
-        try await Task.sleep(for: .milliseconds(10))
-        initTask.cancel()
+        try await connectWithMockServer(client, transport: transport)
 
         // Call withBatch but don't add any requests
         try await client.withBatch { _ in
@@ -519,29 +309,7 @@ struct ClientTests {
         let transport = MockTransport()
         let client = Client(name: "TestClient", version: "1.0")
 
-        // Set up a task to handle the initialize response
-        let initTask = Task {
-            try await Task.sleep(for: .milliseconds(10))
-            if let lastMessage = await transport.sentMessages.last,
-                let data = lastMessage.data(using: .utf8),
-                let request = try? JSONDecoder().decode(Request<Initialize>.self, from: data)
-            {
-                let response = Initialize.response(
-                    id: request.id,
-                    result: .init(
-                        protocolVersion: Version.latest,
-                        capabilities: .init(),
-                        serverInfo: .init(name: "TestServer", version: "1.0"),
-                        instructions: nil
-                    )
-                )
-                try await transport.queue(response: response)
-            }
-        }
-
-        try await client.connect(transport: transport)
-        try await Task.sleep(for: .milliseconds(10))
-        initTask.cancel()
+        try await connectWithMockServer(client, transport: transport)
 
         // Create a test notification
         let notification = InitializedNotification.message()
@@ -575,76 +343,16 @@ struct ClientTests {
         let transport = MockTransport()
         let client = Client(name: "TestClient", version: "1.0")
 
-        // Create a task for initialize
-        let initTask = Task {
-            // Queue a response for the initialize request
-            try await Task.sleep(for: .milliseconds(10))  // Wait for request to be sent
+        try await connectWithMockServer(client, transport: transport)
 
-            if let lastMessage = await transport.sentMessages.last,
-                let data = lastMessage.data(using: .utf8),
-                let request = try? JSONDecoder().decode(Request<Initialize>.self, from: data)
-            {
-
-                // Create a valid initialize response
-                let response = Initialize.response(
-                    id: request.id,
-                    result: .init(
-                        protocolVersion: Version.latest,
-                        capabilities: .init(),
-                        serverInfo: .init(name: "TestServer", version: "1.0"),
-                        instructions: nil
-                    )
-                )
-
-                try await transport.queue(response: response)
-
-                // Now complete the initialize call
-                try await client.connect(transport: transport)
-                try await Task.sleep(for: .milliseconds(10))
-
-                // Verify that two messages were sent: initialize request and initialized notification
-                #expect(await transport.sentMessages.count == 2)
-
-                // Check that the second message is the initialized notification
-                let notifications = await transport.sentMessages
-                if notifications.count >= 2 {
-                    let notificationJson = notifications[1]
-                    if let notificationData = notificationJson.data(using: .utf8) {
-                        do {
-                            let decoder = JSONDecoder()
-                            let decodedNotification = try decoder.decode(
-                                Message<InitializedNotification>.self, from: notificationData)
-                            #expect(decodedNotification.method == InitializedNotification.name)
-                        } catch {
-                            #expect(Bool(false), "Failed to decode notification: \(error)")
-                        }
-                    } else {
-                        #expect(Bool(false), "Could not convert notification to data")
-                    }
-                } else {
-                    #expect(
-                        Bool(false), "Expected both initialize request and initialized notification"
-                    )
-                }
-            }
-        }
-
-        // Wait with timeout
-        let timeoutTask = Task {
-            try await Task.sleep(for: .seconds(1))
-            initTask.cancel()
-        }
-
-        // Wait for the task to complete
-        do {
-            _ = try await initTask.value
-        } catch is CancellationError {
-            #expect(Bool(false), "Test timed out")
-        } catch {
-            #expect(Bool(false), "Unexpected error: \(error)")
-        }
-
-        timeoutTask.cancel()
+        let sentMessages = await transport.sentMessages
+        #expect(sentMessages.count == 2)
+        let notificationData = try #require(sentMessages.last?.data(using: .utf8))
+        let decodedNotification = try JSONDecoder().decode(
+            Message<InitializedNotification>.self,
+            from: notificationData
+        )
+        #expect(decodedNotification.method == InitializedNotification.name)
 
         await client.disconnect()
     }
@@ -654,29 +362,7 @@ struct ClientTests {
         let transport = MockTransport()
         let client = Client(name: "TestClient", version: "1.0")
 
-        // Set up a task to handle the initialize response
-        let initTask = Task {
-            try await Task.sleep(for: .milliseconds(10))
-            if let lastMessage = await transport.sentMessages.last,
-                let data = lastMessage.data(using: .utf8),
-                let request = try? JSONDecoder().decode(Request<Initialize>.self, from: data)
-            {
-                let response = Initialize.response(
-                    id: request.id,
-                    result: .init(
-                        protocolVersion: Version.latest,
-                        capabilities: .init(),
-                        serverInfo: .init(name: "TestServer", version: "1.0"),
-                        instructions: nil
-                    )
-                )
-                try await transport.queue(response: response)
-            }
-        }
-
-        try await client.connect(transport: transport)
-        try await Task.sleep(for: .milliseconds(10))
-        initTask.cancel()
+        try await connectWithMockServer(client, transport: transport)
 
         // Set up the transport to fail sends from the start
         await transport.setFailSend(true)
@@ -715,29 +401,7 @@ struct ClientTests {
         let transport = MockTransport()
         let client = Client(name: "TestClient", version: "1.0")
 
-        // Set up a task to handle the initialize response
-        let initTask = Task {
-            try await Task.sleep(for: .milliseconds(10))
-            if let lastMessage = await transport.sentMessages.last,
-                let data = lastMessage.data(using: .utf8),
-                let request = try? JSONDecoder().decode(Request<Initialize>.self, from: data)
-            {
-                let response = Initialize.response(
-                    id: request.id,
-                    result: .init(
-                        protocolVersion: Version.latest,
-                        capabilities: .init(),
-                        serverInfo: .init(name: "TestServer", version: "1.0"),
-                        instructions: nil
-                    )
-                )
-                try await transport.queue(response: response)
-            }
-        }
-
-        try await client.connect(transport: transport)
-        try await Task.sleep(for: .milliseconds(10))
-        initTask.cancel()
+        try await connectWithMockServer(client, transport: transport)
 
         // Create a ping request to get the ID
         let request = Ping.request()

@@ -291,7 +291,7 @@ public actor HTTPClientTransport: Transport, HTTPRequestSendingTransport {
 
             do {
                 #if os(Linux)
-                    let (responseData, response) = try await session.data(for: request)
+                    let (responseData, response) = try await session.mcpTransportData(for: request)
                     try await processResponse(
                         response: response,
                         data: responseData,

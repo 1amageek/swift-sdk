@@ -7,6 +7,10 @@ import struct Foundation.POSIXError
 
 @testable import MCP
 
+enum MockTransportError: Error, Equatable {
+    case timedOutWaitingForSentData(index: Int)
+}
+
 /// Mock transport for testing
 actor MockTransport: Transport {
     var logger: Logger
@@ -106,6 +110,35 @@ actor MockTransport: Transport {
 
     func queue(batch responses: [AnyResponse]) throws {
         queue(data: try encoder.encode(responses))
+    }
+
+    func queueInitializeResponse(timeout: Duration = .seconds(5)) async throws {
+        let data = try await waitForSentData(at: 0, timeout: timeout)
+        let request = try decoder.decode(Request<Initialize>.self, from: data)
+        let response = Initialize.response(
+            id: request.id,
+            result: .init(
+                protocolVersion: Version.latest,
+                capabilities: .init(),
+                serverInfo: .init(name: "TestServer", version: "1.0"),
+                instructions: nil
+            )
+        )
+        try queue(response: response)
+    }
+
+    func waitForSentData(at index: Int, timeout: Duration = .seconds(5)) async throws -> Data {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+
+        while sentData.count <= index {
+            guard clock.now < deadline else {
+                throw MockTransportError.timedOutWaitingForSentData(index: index)
+            }
+            try await clock.sleep(for: .milliseconds(1))
+        }
+
+        return sentData[index]
     }
 
     func decodeLastSentMessage<T: Decodable>() -> T? {
