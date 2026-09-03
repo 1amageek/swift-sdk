@@ -90,11 +90,12 @@ fallback rule.
 | Contract | Guarantee |
 | --- | --- |
 | Public raw transport | `Transport: Actor` retains `logger`, `connect()`, `disconnect()`, `send(Data)`, and `receive() -> AsyncThrowingStream<Data, Error>`. Existing custom transports continue to compile and behave as raw byte channels. |
-| Modern HTTP admission | Each request is a new POST. The transport validates standard protocol header syntax/consistency (`MCP-Protocol-Version`, `Mcp-Method`, and applicable `Mcp-Name`) and Origin before delivery, mints an `ExchangeID`, and maps typed boundary failures to HTTP status. Server owns header applicability, tool-schema custom-header, and method-semantic validation. |
+| Modern HTTP admission | Each request is a new POST. The transport validates HTTP/body syntax, safely normalizes standard header names and OWS, validates the modern protocol version and Origin before delivery, mints an `ExchangeID`, and maps typed boundary failures to HTTP status. Server owns header/body meaning, header applicability, tool-schema custom-header, and method-semantic validation. |
 | Modern HTTP lifecycle | No modern session ID, GET subscription endpoint, `Last-Event-ID`, replay, or DELETE lifecycle is used. A per-request JSON or SSE result ends with that exchange. |
 | Legacy HTTP compatibility | Existing stateful initialize/session/GET-SSE/DELETE/replay paths remain available for legacy peers and are not selected for modern requests. |
 | Exchange identity | `ExchangeID` is unique for the lifetime of one admitted POST and is independent of the JSON-RPC `ID`. Equal JSON-RPC IDs in concurrent POSTs cannot share a waiter, context, response, notification, or cancellation. |
-| Context | Raw HTTP headers/body/path/auth context is carried immutably for delivery; Server owns normalization and combines the current request/auth context with the tool schema and Base resolver for custom-header validation. |
+| Context | Raw HTTP headers/body/path/auth context is carried immutably for delivery. Transport canonicalizes standard header names and safe OWS; Server combines the request/auth context with the tool schema and Base resolver for semantic and custom-header validation. |
+| Modern SSE delivery | Each exchange retains at most the current event and one pending event. A terminal event may occupy the pending slot without waiting for the consumer, so shutdown is bounded while delivery order remains acknowledgement/notification before terminal. |
 | Cleanup | Validation failure, response, handler failure, cancellation, disconnect, and shutdown release every exchange waiter and context exactly once. |
 | Stdio | Modern discovery/fallback uses one live connection and one receive stream; it never opens a probe connection and then a second operational connection. |
 | Concurrency | Transport actor isolation serializes routing maps; independent exchanges may progress concurrently without JSON-RPC-ID collisions. |
@@ -149,15 +150,17 @@ are not silently delivered to another exchange.
 
 ## Failure, Concurrency, and Constraints
 
-- HTTP validation runs before the body enters server dispatch. Header/body
-  version mismatch is `400` with typed `HeaderMismatch`; unsupported versions
-  are `400` with typed `UnsupportedProtocolVersion`; invalid Origin is `403`.
-  Server's typed method-not-found result is mapped to modern HTTP `404` with
-  `-32601`; Transport does not decide method semantics.
+- HTTP validation runs before the body enters server dispatch. Unsafe standard
+  header values and unsupported versions fail before delivery; unsupported
+  versions are `400` with typed `UnsupportedProtocolVersion`, and invalid
+  Origin is `403`. Server's typed header/body mismatch is mapped to modern HTTP
+  `400` with `-32020`, and its typed method-not-found result is mapped to
+  modern HTTP `404` with `-32601`; Transport does not decide method semantics.
 - A cancelled or disconnected exchange resumes its waiter with a typed failure,
   removes its context, and ignores a late response.
 - Modern SSE is per request and non-resumable. Legacy resumability remains only
-  on the legacy branch.
+  on the legacy branch. Non-terminal producers apply bounded backpressure;
+  terminal delivery never makes shutdown wait for an inactive consumer.
 - Transport does not perform unbounded response buffering, cursor traversal, or
   schema walking. Higher-layer limits are enforced by their owners.
 

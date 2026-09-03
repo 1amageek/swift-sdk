@@ -108,6 +108,7 @@ designs; this table is the package-wide compatibility invariant.
 | user input and persistence | application | SDK handlers receive an application-provided Roots/Sampling/Elicitation decision; SDK does not store user data |
 | MRTR rounds | the active client request orchestration | `Client` owns the positive `maxRounds` limit, which defaults to `10`; exhaustion is a typed failure |
 | paginated tool discovery | the transient client resolution operation | `maxToolListPages` is positive and defaults to `64`; cursor cycles and bound exhaustion are failures |
+| server tool-schema lookup | the current `Server` request dispatch | `Server.Configuration.maxToolSchemaLookupPages` is positive and defaults to `64`; lookup uses the current authorization context, bounds seen cursors, and reports cursor cycles or page exhaustion as typed failures |
 | subscriptions | server configuration and registry | `maxSubscriptions` is positive and defaults to `1024`; overflow is a typed failure |
 
 All new validation and failure paths are explicit. They do not convert malformed
@@ -286,8 +287,9 @@ O(schema depth) temporary traversal storage and retains immutable bindings only
 for the one operation. It has no arbitrary schema-size rejection threshold and
 never dereferences a network `$ref`; Base owns traversal complexity. A finite
 schema therefore succeeds regardless of size or depth unless it contains an
-invalid annotation or unsupported value. Client still owns paginated discovery
-bounds and cursor-cycle failures.
+invalid annotation or unsupported value. Pagination remains outside Base:
+Client owns its discovery bound and Server owns its request-local tool-schema
+lookup bound.
 
 - Actors serialize connection, pending-request, handler-registration, and
   semantic subscription mutations. External I/O occurs outside unrelated
@@ -300,12 +302,14 @@ bounds and cursor-cycle failures.
 - Cancellation is advisory on the wire and authoritative for local pending
   state: the local waiter is removed once, late responses are ignored, and
   server work is cancelled when the owner can cancel it.
-- `maxRounds = 10`, `maxToolListPages = 64`, and `maxSubscriptions = 1024` are
-  positive configurable safety limits. Tests must prove both the normal path and
-  the limit failure path.
+- `maxRounds = 10`, `maxToolListPages = 64`,
+  `maxToolSchemaLookupPages = 64`, and `maxSubscriptions = 1024` are positive
+  configurable safety limits. Tests must prove both the normal path and the
+  limit failure path.
 - A protocol-core schema walk is finite and local to caller-owned values. It
   never resolves a network `$ref` while deriving tool headers; Base owns the
-  traversal complexity and Client owns discovery pagination bounds.
+  traversal complexity and owns no pagination. Client owns discovery pagination;
+  Server separately owns current-request tool-schema lookup pagination.
 
 ## Verification and Change Impact
 

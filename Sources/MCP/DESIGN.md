@@ -107,7 +107,8 @@ cleanup rules.
   coordinator is introduced.
 - One JSON-RPC request ID is not used as an HTTP exchange identity.
 - The fixed positive defaults are `maxRounds = 10`, `maxToolListPages = 64`,
-  and `maxSubscriptions = 1024`; the owning child enforces each bound.
+  `maxToolSchemaLookupPages = 64`, and `maxSubscriptions = 1024`; Client owns
+  the first two limits and Server owns the latter two.
 - New code reports failure explicitly and does not use empty success values as a
   fallback for malformed or unsupported modern messages.
 

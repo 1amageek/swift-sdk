@@ -66,8 +66,8 @@ model trees.
 | MRTR values | Input-required results distinguish complete from input-required state, preserve opaque `requestState`, and carry keyed input requests/responses without inventing application decisions. `InputResponse` stores only its raw wire value; the caller supplies the originating method to `validate(for:)`, because the open union may be ambiguous when extension fields are present. |
 | Subscription values | Subscription filters, acknowledgement metadata, and terminal results are represented as protocol data; stream ownership remains in orchestration/transport. |
 | Header derivation | The resolver uses an iterative worklist over the finite acyclic caller-owned `Value`; only statically reachable `properties` produce bindings. Non-properties branches are inspected for forbidden annotations. Work is O(schema nodes), temporary storage is O(schema depth), and immutable bindings live for one operation. Invalid or duplicate `x-mcp-header` annotations exclude the tool; null/missing values are omitted; string/integer/boolean values use the specified safe encoding. |
-| Schema boundary | Tool-header schema walks are finite and local to the caller-owned acyclic `Value`; no arbitrary node-count threshold is imposed, no network `$ref` is dereferenced, and Base owns traversal complexity. Client owns paginated tool discovery, `maxToolListPages = 64`, and cursor-cycle failures. |
-| Failure | Missing/invalid modern fields, mismatched versions, unsupported capabilities, and invalid header annotations produce typed failures rather than empty success. A finite schema walk terminates without an arbitrary size rejection; malformed or unsupported values remain failures, and network `$ref` targets are never fetched. Client reports pagination-bound and cursor-cycle failures. |
+| Schema boundary | Tool-header schema walks are finite and local to the caller-owned acyclic `Value`; no arbitrary node-count threshold is imposed, no network `$ref` is dereferenced, and Base owns traversal complexity but no pagination. Client owns paginated discovery through `maxToolListPages = 64`; Server separately owns request-local current-authorization tool-schema lookup through `maxToolSchemaLookupPages = 64`. |
+| Failure | Missing/invalid modern fields, mismatched versions, unsupported capabilities, and invalid header annotations produce typed failures rather than empty success. A finite schema walk terminates without an arbitrary size rejection; malformed or unsupported values remain failures, and network `$ref` targets are never fetched. Client and Server report their own pagination-bound and cursor-cycle failures. |
 
 `ConnectionInfo`, `ProtocolEra`, and typed modern failure values are internal or
 public only at the API boundary where the module design requires them. Their
@@ -117,6 +117,9 @@ session key by Base.
   never dereferences a network `$ref`.
 - Client owns paginated tool discovery, with positive `maxToolListPages` default
   `64`; cursor cycles and page-bound exhaustion are failures, not infinite loops.
+- Server independently owns request-local tool-schema lookup pagination, with
+  positive `maxToolSchemaLookupPages` default `64`; Base retains no page or
+  cursor state for either operation.
 - Unknown extension fields are preserved where the existing `Value`/metadata
   contract permits, while malformed required fields fail decoding.
 

@@ -22,6 +22,10 @@ struct ToolHeaderResolver: Sendable {
 
     private let bindings: [HeaderBinding]
 
+    var recognizedHeaderNames: Set<String> {
+        Set(bindings.map { "Mcp-Param-\($0.name)".lowercased() })
+    }
+
     init(schema: Value) throws {
         guard case .object(let fields) = schema else {
             throw ProtocolCoreError.invalidToolSchema("schema must be an object")
@@ -50,15 +54,26 @@ struct ToolHeaderResolver: Sendable {
     /// Resolves argument values at the exact statically reachable property
     /// paths captured by this schema.
     func resolve(arguments: [String: Value]) throws -> [String: String] {
+        let values = try resolveValues(arguments: arguments)
         var headers: [String: String] = [:]
-        headers.reserveCapacity(bindings.count)
+        headers.reserveCapacity(values.count)
+        for (name, value) in values {
+            headers[name] = try Self.encodeHeaderValue(value)
+        }
+        return headers
+    }
+
+    func resolveValues(arguments: [String: Value]) throws -> [String: Value] {
+        var values: [String: Value] = [:]
+        values.reserveCapacity(bindings.count)
         for binding in bindings {
             guard let value = Self.value(at: binding.path, in: arguments), !value.isNull else {
                 continue
             }
-            headers["Mcp-Param-\(binding.name)"] = try Self.encodeHeaderValue(value, as: binding.kind)
+            _ = try Self.encodeHeaderValue(value, as: binding.kind)
+            values["Mcp-Param-\(binding.name)"] = value
         }
-        return headers
+        return values
     }
 
     /// Resolves arguments supplied as a lossless protocol value.
@@ -84,6 +99,19 @@ struct ToolHeaderResolver: Sendable {
         default:
             throw ProtocolCoreError.invalidHeaderValue("only string, integer, and boolean values are supported")
         }
+    }
+
+    static func decodeHeaderValue(_ value: String) throws -> String {
+        let prefix = "=?base64?"
+        let suffix = "?="
+        guard value.hasPrefix(prefix), value.hasSuffix(suffix) else { return value }
+        let encoded = value.dropFirst(prefix.count).dropLast(suffix.count)
+        guard let data = Data(base64Encoded: String(encoded)),
+            let decoded = String(data: data, encoding: .utf8)
+        else {
+            throw ProtocolCoreError.invalidHeaderValue("invalid Base64 sentinel value")
+        }
+        return decoded
     }
 
     private final class PathNode {
