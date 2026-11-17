@@ -1,6 +1,6 @@
 import Logging
 
-import struct Foundation.Data
+import Foundation
 
 #if canImport(System)
     import System
@@ -53,6 +53,11 @@ import struct Foundation.Data
         /// Logger instance for transport-related events
         public nonisolated let logger: Logger
 
+        private let limits: Limits?
+        private var readTask: Task<Void, Never>?
+        private var writes: [UUID: Task<Void, Swift.Error>] = [:]
+        private var lastWrite: Task<Void, Swift.Error>?
+        private var finished = false
         private var isConnected = false
         private let messageStream: AsyncThrowingStream<Data, Swift.Error>
         private let messageContinuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
@@ -66,8 +71,10 @@ import struct Foundation.Data
         public init(
             input: FileDescriptor = FileDescriptor.standardInput,
             output: FileDescriptor = FileDescriptor.standardOutput,
-            logger: Logger? = nil
+            logger: Logger? = nil,
+            limits: Limits? = nil
         ) {
+            self.limits = limits
             self.input = input
             self.output = output
             self.logger =
@@ -78,7 +85,7 @@ import struct Foundation.Data
 
             // Create message stream
             var continuation: AsyncThrowingStream<Data, Swift.Error>.Continuation!
-            self.messageStream = AsyncThrowingStream { continuation = $0 }
+            self.messageStream = AsyncThrowingStream(bufferingPolicy: limits.map { .bufferingOldest(max(1, min(1024, $0.maximumBufferedMessages))) } ?? .unbounded) { continuation = $0 }
             self.messageContinuation = continuation
         }
 
@@ -90,6 +97,9 @@ import struct Foundation.Data
         /// - Throws: Error if the file descriptors cannot be configured
         public func connect() async throws {
             guard !isConnected else { return }
+            if let limits {
+                guard !finished, (1...16_777_216).contains(limits.maximumMessageBytes), (1...1024).contains(limits.maximumBufferedMessages), limits.writeTimeout > .zero else { throw MCPError.invalidParams("Invalid or completed bounded stdio profile") }
+            }
 
             // Set non-blocking mode
             try setNonBlocking(fileDescriptor: input)
@@ -99,7 +109,7 @@ import struct Foundation.Data
             logger.debug("Transport connected successfully")
 
             // Start reading loop in background
-            Task {
+            readTask = Task {
                 await readLoop()
             }
         }
@@ -146,6 +156,7 @@ import struct Foundation.Data
 
                     if bytesRead == 0 {
                         logger.notice("EOF received")
+                        if limits != nil && !pendingData.isEmpty { throw MCPError.parseError("Truncated stdio frame at EOF") }
                         break
                     }
 
@@ -154,25 +165,29 @@ import struct Foundation.Data
                     // Process complete messages
                     while let newlineIndex = pendingData.firstIndex(of: UInt8(ascii: "\n")) {
                         let messageData = pendingData[..<newlineIndex]
+                        if let limits, messageData.count > limits.maximumMessageBytes { throw MCPError.invalidRequest("Stdio frame exceeds its byte budget") }
                         pendingData = pendingData[(newlineIndex + 1)...]
 
                         if !messageData.isEmpty {
                             logger.trace(
                                 "Message received", metadata: ["size": "\(messageData.count)"])
-                            messageContinuation.yield(Data(messageData))
+                            if case .dropped = messageContinuation.yield(Data(messageData)) { throw MCPError.invalidRequest("Stdio input queue exceeded its message budget") }
                         }
                     }
+                    if let limits, pendingData.count > limits.maximumMessageBytes { throw MCPError.invalidRequest("Stdio frame exceeds its byte budget") }
                 } catch let error where MCPError.isResourceTemporarilyUnavailable(error) {
-                    try? await Task.sleep(for: .milliseconds(10))
+                    do { try await Task.sleep(for: .milliseconds(10)) } catch { break }
                     continue
                 } catch {
                     if !Task.isCancelled {
                         logger.error("Read error occurred", metadata: ["error": "\(error)"])
+                        if limits != nil { messageContinuation.finish(throwing: error) }
                     }
                     break
                 }
             }
 
+            finished = true
             messageContinuation.finish()
         }
 
@@ -180,8 +195,13 @@ import struct Foundation.Data
         ///
         /// This stops the message reading loop and releases associated resources.
         public func disconnect() async {
-            guard isConnected else { return }
             isConnected = false
+            let reader = readTask; readTask = nil; reader?.cancel()
+            let pendingWrites = Array(writes.values)
+            for task in pendingWrites { task.cancel() }
+            if let reader { await reader.value }
+            for task in pendingWrites { _ = await task.result }
+            writes.removeAll(); lastWrite = nil
             messageContinuation.finish()
             logger.debug("Transport disconnected")
         }
@@ -195,29 +215,43 @@ import struct Foundation.Data
         /// - Parameter message: The message data to send (without a trailing newline)
         /// - Throws: Error if the message cannot be sent
         public func send(_ message: Data) async throws {
-            guard isConnected else {
-                throw MCPError.transportError(Errno(rawValue: ENOTCONN))
+            guard isConnected else { throw MCPError.transportError(Errno(rawValue: ENOTCONN)) }
+            if let limits { guard message.count <= limits.maximumMessageBytes, writes.count < limits.maximumBufferedMessages else { throw MCPError.invalidRequest("Stdio output exceeds its message/queue budget") } }
+            let id = UUID(), previous = lastWrite
+            let task = Task {
+                if let previous { try await previous.value }
+                try Task.checkCancellation()
+                try await self.writeFrame(message)
             }
+            writes[id] = task; lastWrite = task
+            defer { writes[id] = nil; if writes.isEmpty { lastWrite = nil } }
+            do { try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() } }
+            catch {
+                if limits != nil {
+                    messageContinuation.finish(throwing: error)
+                    await disconnect()
+                }
+                throw error
+            }
+        }
 
-            // Add newline as delimiter
-            var messageWithNewline = message
-            messageWithNewline.append(UInt8(ascii: "\n"))
-
-            var remaining = messageWithNewline
-            while !remaining.isEmpty {
+        private func writeFrame(_ message: Data) async throws {
+            var bytes = message; bytes.append(UInt8(ascii: "\n"))
+            var offset = 0
+            let deadline = limits.map { ContinuousClock.now.advanced(by: $0.writeTimeout) }
+            while offset < bytes.count {
+                try Task.checkCancellation()
+                guard isConnected else { throw MCPError.transportError(Errno(rawValue: ENOTCONN)) }
+                if let deadline, ContinuousClock.now >= deadline { throw MCPError.internalError("Stdio write deadline exceeded") }
                 do {
-                    let written = try remaining.withUnsafeBytes { buffer in
-                        try output.write(UnsafeRawBufferPointer(buffer))
+                    let written = try bytes.withUnsafeBytes { buffer in
+                        try output.write(UnsafeRawBufferPointer(rebasing: buffer[offset...]))
                     }
-                    if written > 0 {
-                        remaining = remaining.dropFirst(written)
-                    }
+                    guard written > 0 else { throw MCPError.internalError("Stdio write made no progress") }
+                    offset += written
                 } catch let error where MCPError.isResourceTemporarilyUnavailable(error) {
                     try await Task.sleep(for: .milliseconds(10))
-                    continue
-                } catch {
-                    throw MCPError.transportError(error)
-                }
+                } catch { throw MCPError.transportError(error) }
             }
         }
 

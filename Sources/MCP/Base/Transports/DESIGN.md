@@ -204,3 +204,9 @@ regression class.
 Changes to exchange identity, HTTP status/error mapping, authorization retry
 lifetime, stream lifecycle, or raw method signatures require rechecking Base,
 Client, Server, Authorization, and the package master.
+
+## Optional bounded stdio profile
+
+`StdioTransport.Limits` is an additive consumer-selected boundary. Existing initializers keep their legacy unrestricted framing behavior. A selected profile bounds each frame, buffered inbound messages, queued sends, and write wait time; truncated EOF and overflow finish with typed failure. Transport owns its reader task and drains it on disconnect. Serialized outbound tasks prevent partial writes from separate messages interleaving across suspension. This does not change MCP method semantics or supported protocol eras. Focused StdioTransportLimitsTests own overflow, EOF, full-output cancellation and concurrent frame integrity; Invar exercises the actual Server lifecycle over this public profile.
+
+A failed/cancelled bounded frame write is terminal for that transport. A partial JSON frame cannot be followed by a new frame on the same stream. Disconnect drains the reader and queued writers before returning.
