@@ -49,11 +49,32 @@ readonly SERVER_SCENARIOS=(
   input-required-result-validate-input
 )
 
+# The Skills extension (SEP-2640) is not in the frozen alpha.10 file. It is
+# refereed by a separate pin and never changes the scored gate above.
+readonly SKILLS_CONFORMANCE_PACKAGE="@modelcontextprotocol/conformance@0.2.0-alpha.12"
+readonly SKILLS_SERVER_SCENARIOS=(
+  sep-2640-skills-enumeration
+  sep-2640-skills-manifest
+  sep-2640-skills-directory
+)
+readonly SKILLS_CLIENT_SCENARIOS=(
+  sep-2640-client-no-prefetch
+  sep-2640-client-verify-digest
+  sep-2640-client-verify-size
+  sep-2640-client-verify-frontmatter
+)
+readonly SKILLS_SPEC_VERSIONS=(2025-11-25 2026-07-28)
+
 MODE="both"
+SUITE="scored"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode)
       MODE="$2"
+      shift 2
+      ;;
+    --suite)
+      SUITE="$2"
       shift 2
       ;;
     *)
@@ -67,6 +88,14 @@ case "$MODE" in
   client|server|both) ;;
   *)
     printf 'Invalid mode: %s\n' "$MODE" >&2
+    exit 1
+    ;;
+esac
+
+case "$SUITE" in
+  scored|skills) ;;
+  *)
+    printf 'Invalid suite: %s\n' "$SUITE" >&2
     exit 1
     ;;
 esac
@@ -143,7 +172,9 @@ JSON
 }
 
 cd "$REPOSITORY_ROOT"
-write_not_scored_report
+if [[ "$SUITE" == "scored" ]]; then
+  write_not_scored_report
+fi
 
 if [[ "$MODE" == "client" || "$MODE" == "both" ]]; then
   build_product "$CLIENT_EXECUTABLE"
@@ -156,7 +187,22 @@ readonly BIN_PATH="$(swift build --show-bin-path)"
 readonly CLIENT_PATH="$BIN_PATH/$CLIENT_EXECUTABLE"
 readonly SERVER_PATH="$BIN_PATH/$SERVER_EXECUTABLE"
 
-if [[ "$MODE" == "client" || "$MODE" == "both" ]]; then
+if [[ "$SUITE" == "skills" ]] && [[ "$MODE" == "client" || "$MODE" == "both" ]]; then
+  for version in "${SKILLS_SPEC_VERSIONS[@]}"; do
+    for scenario in "${SKILLS_CLIENT_SCENARIOS[@]}"; do
+      run_with_timeout "$PROCESS_TIMEOUT_SECONDS" \
+        npx --yes "$SKILLS_CONFORMANCE_PACKAGE" client \
+          --command "$CLIENT_PATH" \
+          --scenario "$scenario" \
+          --timeout "$CLIENT_SCENARIO_TIMEOUT_MS" \
+          --spec-version "$version" \
+          --force \
+          --output-dir "$EVIDENCE_DIR/skills-client-$version"
+    done
+  done
+fi
+
+if [[ "$SUITE" == "scored" ]] && [[ "$MODE" == "client" || "$MODE" == "both" ]]; then
   run_with_timeout "$PROCESS_TIMEOUT_SECONDS" \
     npx --yes "$CONFORMANCE_PACKAGE" client \
       --command "$CLIENT_PATH" \
@@ -204,7 +250,25 @@ wait_for_server() {
   return 1
 }
 
-if [[ "$MODE" == "server" || "$MODE" == "both" ]]; then
+if [[ "$SUITE" == "skills" ]] && [[ "$MODE" == "server" || "$MODE" == "both" ]]; then
+  "$SERVER_PATH" > "$EVIDENCE_DIR/server.log" 2>&1 &
+  SERVER_PID=$!
+  wait_for_server
+  for version in "${SKILLS_SPEC_VERSIONS[@]}"; do
+    for scenario in "${SKILLS_SERVER_SCENARIOS[@]}"; do
+      run_with_timeout "$PROCESS_TIMEOUT_SECONDS" \
+        npx --yes "$SKILLS_CONFORMANCE_PACKAGE" server \
+          --url "$SERVER_URL" \
+          --scenario "$scenario" \
+          --spec-version "$version" \
+          --force \
+          --output-dir "$EVIDENCE_DIR/skills-server-$version"
+    done
+  done
+  cleanup_server
+fi
+
+if [[ "$SUITE" == "scored" ]] && [[ "$MODE" == "server" || "$MODE" == "both" ]]; then
   if [[ "${#SERVER_SCENARIOS[@]}" -ne 37 ]]; then
     printf 'Expected 37 frozen server scenarios, found %s\n' \
       "${#SERVER_SCENARIOS[@]}" >&2

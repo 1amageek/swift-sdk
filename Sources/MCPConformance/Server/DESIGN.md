@@ -67,6 +67,7 @@ validation and return the typed result or error.
 | Validation ownership | No protocol/header/schema/MRTR validation is duplicated here. Fixture handlers return `InputRequiredResult` and typed `MCPError` values through the SDK contracts. |
 | Failure | Setup, dispatch, and fixture failures remain errors. Only the existing HTTP shutdown close is best-effort. |
 | Fixture coverage | The server executable registers the 37 frozen server scenario targets, including diagnostic MRTR tools and prompts, while production SDK tests own the underlying semantic contracts. |
+| Skills fixture | One immutable `SkillCatalog` (two skills, each with a subdirectory, one entry per page) is built at startup and installed with `Server.withSkills` on every modern and legacy server. Its `manifestResources` are appended to the fixture `resources/list`; skill files are served by the SDK's mounted namespace ahead of the fixture `resources/read`. Resource templates appear only in `resources/templates/list`. |
 
 ## Runtime Flows
 
