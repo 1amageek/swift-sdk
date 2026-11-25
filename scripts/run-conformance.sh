@@ -7,6 +7,9 @@ readonly CLIENT_EXECUTABLE="mcp-everything-client"
 readonly SERVER_EXECUTABLE="mcp-everything-server"
 readonly CLIENT_SCENARIO_TIMEOUT_MS="${CLIENT_SCENARIO_TIMEOUT_MS:-30000}"
 readonly PROCESS_TIMEOUT_SECONDS="${PROCESS_TIMEOUT_SECONDS:-120}"
+# A cold build resolves and compiles every dependency, so it gets its own
+# budget; the CI job timeout stays the outer bound.
+readonly BUILD_TIMEOUT_SECONDS="${BUILD_TIMEOUT_SECONDS:-480}"
 readonly STARTUP_TIMEOUT_SECONDS="${STARTUP_TIMEOUT_SECONDS:-20}"
 readonly SERVER_URL="${SERVER_URL:-http://127.0.0.1:3001/mcp}"
 readonly SERVER_SCENARIOS=(
@@ -132,7 +135,7 @@ run_with_timeout() {
 }
 
 build_product() {
-  run_with_timeout "$PROCESS_TIMEOUT_SECONDS" \
+  run_with_timeout "$BUILD_TIMEOUT_SECONDS" \
     swift build --product "$1"
 }
 
