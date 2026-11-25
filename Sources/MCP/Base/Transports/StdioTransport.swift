@@ -68,6 +68,8 @@ import Foundation
         ///   - input: File descriptor for reading (defaults to standard input)
         ///   - output: File descriptor for writing (defaults to standard output)
         ///   - logger: Optional logger instance for transport events
+        ///   - limits: Optional bounds on frame size, buffered messages, and
+        ///     write time; `nil` keeps the transport unbounded
         public init(
             input: FileDescriptor = FileDescriptor.standardInput,
             output: FileDescriptor = FileDescriptor.standardOutput,
