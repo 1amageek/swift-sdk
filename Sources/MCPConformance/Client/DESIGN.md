@@ -42,6 +42,7 @@ flowchart LR
 | Era dispatch | `MCP_CONFORMANCE_PROTOCOL_VERSION` selects the additive modern API only for `2026-07-28`; supported legacy versions use the unchanged legacy API. |
 | Context | Structured `MCP_CONFORMANCE_CONTEXT` is decoded as MCP `Value`; malformed JSON is a typed adapter failure. |
 | Behavioral evidence | A scenario performs the operations that its referee observes; connection alone is not reported as scenario success. |
+| Skills scenarios | `sep-2640-client-*` list every skill through `SkillsClient.listAll`. Except for `no-prefetch`, they then load the first skill through verified `SkillsClient.read` calls, `SKILL.md` first, so a verification failure exits with an error before any supporting file is read. |
 | Secrets | OAuth credentials, assertions, and tokens are passed to SDK configuration but never written to logs. |
 
 ## Runtime Flows

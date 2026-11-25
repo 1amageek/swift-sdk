@@ -77,6 +77,8 @@ separate branches of one actor contract.
 | Subscription semantics | `subscriptions/listen` registers a bounded subscription, sends acknowledgement first, applies requested filters, and removes state on cancel, terminal result, disconnect, or shutdown. Shutdown does not wait for the peer to consume a buffered acknowledgement. |
 | Resource limit | `maxSubscriptions` is positive and defaults to `1024`; overflow is a typed failure, not an unbounded dictionary growth path. |
 | Handler failure | Application errors become typed protocol errors with the request ID preserved; cancellation does not fabricate a successful result. |
+| Extension capabilities | `capabilities.experimental` and `capabilities.extensions` are emitted unchanged by legacy `initialize` and modern `server/discover`. |
+| Mounted resource namespaces | An extension module mounts a `ResourceNamespace` through `package` API. For `resources/read`, after era, initialization, and capability gates, Server asks each mounted namespace in mount order; the first non-nil result is the complete result. Otherwise the application `resources/read` handler runs; when none is registered, the result is `ResourceNotFound` (`-32602`). Namespaces never produce input-required results. |
 
 ## Runtime Flows
 
@@ -127,6 +129,7 @@ sequenceDiagram
 | State | Owner | Lifetime |
 | --- | --- | --- |
 | registered method/notification handlers | Server actor | server configuration through stop |
+| mounted resource namespaces | Server actor | mount through server release |
 | legacy initialization/client capability state | Server actor | legacy live connection through stop |
 | modern request context | Server dispatch operation | request admission through result/error/cancel |
 | tool-schema lookup page and seen cursors | current `tools/call` dispatch | lookup admission through target discovery, terminal cursor, typed failure, or cancellation; never cached across requests |

@@ -45,7 +45,7 @@ struct OAuthDiscoveryClient: Sendable {
             request.setValue(ContentType.json, forHTTPHeaderField: HTTPHeaderName.accept)
 
             do {
-                let (data, response) = try await session.data(for: request)
+                let (data, response) = try await session.mcpData(for: request)
                 guard let httpResponse = response as? HTTPURLResponse,
                     (200..<300).contains(httpResponse.statusCode)
                 else {
@@ -103,7 +103,7 @@ struct OAuthDiscoveryClient: Sendable {
                 request.setValue(ContentType.json, forHTTPHeaderField: HTTPHeaderName.accept)
 
                 do {
-                    let (data, response) = try await session.data(for: request)
+                    let (data, response) = try await session.mcpData(for: request)
                     guard let httpResponse = response as? HTTPURLResponse,
                         (200..<300).contains(httpResponse.statusCode)
                     else {

@@ -10,6 +10,7 @@
 import Foundation
 import Logging
 import MCP
+import MCPSkills
 
 #if canImport(FoundationNetworking)
     import FoundationNetworking
@@ -116,6 +117,7 @@ private func completeToolResult(_ text: String) -> CallTool.Result {
 
 func createConformanceServer(
     state: ServerState,
+    skills: SkillCatalog,
     includeModernFixtures: Bool,
     closeSSEStream: SSEStreamCloser? = nil
 ) async -> Server {
@@ -674,13 +676,20 @@ func createConformanceServer(
     }
 
     // Resources
+    // SEP-2640: the catalog declares the extension, registers the Skills
+    // methods, and serves skill files ahead of the fixture resources below.
+    do {
+        try await server.withSkills(skills)
+    } catch {
+        preconditionFailure("The conformance server declares resources exactly once: \(error)")
+    }
+
     await server.withMethodHandler(ListResources.self) { _ in
         .init(resources: [
             Resource(name: "Static Text Resource", uri: "test://static-text", description: "A simple static text resource", mimeType: "text/plain"),
             Resource(name: "Static Binary Resource", uri: "test://static-binary", description: "A simple static binary resource", mimeType: "application/octet-stream"),
             Resource(name: "Watched Resource", uri: "test://watched", description: "A resource that can be subscribed to for updates", mimeType: "text/plain"),
-            Resource(name: "Template Resource", uri: "test://template/{id}", description: "A resource template with URI parameters", mimeType: "text/plain"),
-        ])
+        ] + skills.manifestResources)
     }
 
     await server.withMethodHandler(ListResourceTemplates.self) { _ in
@@ -827,6 +836,7 @@ struct MCPHTTPServer {
         let logger = loggerConfig
 
         let state = ServerState()
+        let skills = try makeConformanceSkillCatalog()
 
         logger.info("Starting MCP HTTP Server...", metadata: ["port": "\(port)"])
 
@@ -849,6 +859,7 @@ struct MCPHTTPServer {
                 logger.debug("Creating server for session", metadata: ["sessionID": "\(sessionID)"])
                 return await createConformanceServer(
                     state: state,
+                    skills: skills,
                     includeModernFixtures: false,
                     closeSSEStream: { requestID in
                         await transport.closeSSEStream(forRequestID: requestID)
@@ -856,7 +867,7 @@ struct MCPHTTPServer {
                 )
             },
             modernServerFactory: { _ in
-                await createConformanceServer(state: state, includeModernFixtures: true)
+                await createConformanceServer(state: state, skills: skills, includeModernFixtures: true)
             },
             logger: logger
         )

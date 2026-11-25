@@ -13,6 +13,7 @@
 import Foundation
 import Logging
 import MCP
+import MCPSkills
 
 #if canImport(FoundationNetworking)
     import FoundationNetworking
@@ -331,7 +332,7 @@ private func requestOAuthToken(
     }
     request.httpBody = formURLEncodedBody(parameters)
 
-    let (data, response) = try await session.data(for: request)
+    let (data, response) = try await session.mcpData(for: request)
     guard let httpResponse = response as? HTTPURLResponse else {
         throw ConformanceError.invalidArguments("Token endpoint returned an invalid response")
     }
@@ -874,7 +875,60 @@ private func runModernScoredScenario(scenario: String, args: [String]) async thr
 
 // MARK: - Scenario Registry
 
+// MARK: - Skills Scenarios
+
+/// SEP-2640 client scenarios: list without prefetching, then load the
+/// listed skill only through verified reads. A verification failure ends the
+/// scenario with an error before any supporting file is read.
+private func runSkillsScenario(scenario: String, args: [String]) async throws {
+    var logger = Logger(
+        label: "mcp.conformance.client.skills",
+        factory: { StreamLogHandler.standardError(label: $0) }
+    )
+    logger.logLevel = .debug
+
+    guard let serverURLString = args.last,
+        let serverURL = URL(string: serverURLString)
+    else {
+        throw ConformanceError.invalidArguments("Valid server URL is required")
+    }
+    let mode = try conformanceProtocolMode()
+    let transport = makeHTTPTransport(endpoint: serverURL, logger: logger)
+    let client = Client(name: "test-client", version: "1.0.0")
+    try await connectClient(client, transport: transport, mode: mode)
+    do {
+        let listing = try await client.skills.listAll()
+        if scenario != "sep-2640-client-no-prefetch" {
+            guard let skill = listing.skills.first else {
+                throw ConformanceError.invalidArguments("The server listed no skills")
+            }
+            _ = try await client.skills.read(of: skill)
+            if case .listed(let files) = skill.resources {
+                for file in files where file.uri != skill.uri {
+                    _ = try await client.skills.read(file.uri, of: skill)
+                }
+            }
+        }
+        await client.disconnect()
+    } catch {
+        await client.disconnect()
+        throw error
+    }
+}
+
 let scenarioHandlers: [String: ScenarioHandler] = [
+    "sep-2640-client-no-prefetch": {
+        try await runSkillsScenario(scenario: "sep-2640-client-no-prefetch", args: $0)
+    },
+    "sep-2640-client-verify-digest": {
+        try await runSkillsScenario(scenario: "sep-2640-client-verify-digest", args: $0)
+    },
+    "sep-2640-client-verify-size": {
+        try await runSkillsScenario(scenario: "sep-2640-client-verify-size", args: $0)
+    },
+    "sep-2640-client-verify-frontmatter": {
+        try await runSkillsScenario(scenario: "sep-2640-client-verify-frontmatter", args: $0)
+    },
     "initialize": runInitializeScenario,
     "tools_call": runToolsCallScenario,
     "sse-retry": runSSEScenario,

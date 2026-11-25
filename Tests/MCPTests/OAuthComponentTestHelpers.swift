@@ -33,7 +33,7 @@
         }
     }
 
-    final class IsolatedMockURLProtocol: URLProtocol, @unchecked Sendable {
+    final class IsolatedMockURLProtocol: URLProtocol {
         static let sessionKeyHeader = "X-Mock-Key"
         private let loadingState = URLProtocolLoadingState()
 
@@ -51,7 +51,7 @@
             await IsolatedMockStorage.shared.set(key: key, handler: handler)
         }
 
-        func executeHandler(for request: URLRequest) async throws -> (HTTPURLResponse, Data) {
+        static func executeHandler(for request: URLRequest) async throws -> (HTTPURLResponse, Data) {
             let key = request.value(forHTTPHeaderField: IsolatedMockURLProtocol.sessionKeyHeader)
                 ?? "unknown"
             return try await IsolatedMockStorage.shared.execute(key: key, request: request)
@@ -60,17 +60,8 @@
         override class func canInit(with request: URLRequest) -> Bool { true }
         override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
         override func startLoading() {
-            Task {
-                do {
-                    let (response, data) = try await self.executeHandler(for: request)
-                    guard loadingState.beginCompletion() else { return }
-                    client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-                    client?.urlProtocol(self, didLoad: data)
-                    client?.urlProtocolDidFinishLoading(self)
-                } catch {
-                    guard loadingState.beginCompletion() else { return }
-                    client?.urlProtocol(self, didFailWithError: error)
-                }
+            deliverResponse(guardedBy: loadingState) { request in
+                try await Self.executeHandler(for: request)
             }
         }
         override func stopLoading() {

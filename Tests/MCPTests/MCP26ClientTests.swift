@@ -1536,7 +1536,7 @@ extension URLRequest {
     }
 }
 
-private final class MCP26URLProtocol: URLProtocol, @unchecked Sendable {
+private final class MCP26URLProtocol: URLProtocol {
     static let storage = MCP26HTTPBridge()
     private let loadingState = URLProtocolLoadingState()
 
@@ -1549,17 +1549,8 @@ private final class MCP26URLProtocol: URLProtocol, @unchecked Sendable {
     }
 
     override func startLoading() {
-        Task {
-            do {
-                let (response, data) = try await Self.storage.respond(to: request)
-                guard loadingState.beginCompletion() else { return }
-                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-                client?.urlProtocol(self, didLoad: data)
-                client?.urlProtocolDidFinishLoading(self)
-            } catch {
-                guard loadingState.beginCompletion() else { return }
-                client?.urlProtocol(self, didFailWithError: error)
-            }
+        deliverResponse(guardedBy: loadingState) { request in
+            try await Self.storage.respond(to: request)
         }
     }
 

@@ -105,7 +105,7 @@ struct OAuthClientRegistrar: Sendable {
 
         request.httpBody = httpBody
 
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await session.mcpData(for: request)
         if let httpResponse = response as? HTTPURLResponse,
             (400..<500).contains(httpResponse.statusCode)
         {
