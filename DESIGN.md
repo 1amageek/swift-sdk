@@ -3,10 +3,12 @@
 ## Purpose and Scope
 
 This document is the system and SwiftPM package design master for `mcp-swift-sdk`.
-The repository contains one library package, one `MCP` library module, and two
-conformance executable targets. The design describes the dual-era implementation
-boundary for the supported MCP legacy family (`2024-11-05` through
-`2025-11-25`) and `2026-07-28` modern behavior.
+The repository contains one library package, the `MCP` library module, the
+`MCPSkills` extension module, and two conformance executable targets. The
+design describes the dual-era implementation boundary for the supported MCP
+legacy family (`2024-11-05` through `2025-11-25`) and `2026-07-28` modern
+behavior, and the Skills extension (`io.modelcontextprotocol/skills`) built on
+that boundary.
 
 The package root is also the system root, so this is the only root/package
 design master. The module and target designs below own their implementation
@@ -18,6 +20,7 @@ Parent: none.
 Children:
 
 - [MCP module](Sources/MCP/DESIGN.md)
+- [MCPSkills module](Sources/MCPSkills/DESIGN.md)
 - [Client conformance adapter](Sources/MCPConformance/Client/DESIGN.md)
 - [Server conformance adapter](Sources/MCPConformance/Server/DESIGN.md)
 
@@ -44,7 +47,8 @@ and do not become a second protocol implementation.
 
 | Design | Relationship | Contract used | Cautions |
 | --- | --- | --- | --- |
-| [MCP module](Sources/MCP/DESIGN.md) | child/composition root | public module exports and dependency direction | keep the one-module SwiftPM structure |
+| [MCP module](Sources/MCP/DESIGN.md) | child/composition root | public module exports and dependency direction | the core protocol stays one module; extensions with their own dependency graph are separate modules |
+| [MCPSkills module](Sources/MCPSkills/DESIGN.md) | child extension module | Skills wire models, `SkillSource`/`SkillCatalog`, `Server.withSkills`, `SkillsClient` | depends only on `MCP` public/package API plus swift-crypto and Yams |
 | [Base protocol core](Sources/MCP/Base/DESIGN.md) | child of the module | state-free values, messages, metadata, and typed protocol errors | no transport import or connection state |
 | Base utilities | part of Base | request-scoped metadata, progress, cancellation, and request context values | values do not own a connection or task store |
 | [Transport](Sources/MCP/Base/Transports/DESIGN.md) | child of Base | raw `Transport` compatibility and exchange lifetime | JSON-RPC IDs are not HTTP exchange IDs |
@@ -117,7 +121,16 @@ designs; this table is the package-wide compatibility invariant.
 
 All new validation and failure paths are explicit. They do not convert malformed
 messages, unsupported capabilities, or closed streams into successful empty
-values. Tasks and every other `not_scored` extension are outside this change.
+values. Tasks and every other `not_scored` extension except Skills are outside
+this change.
+
+### Extensions
+
+| Concern | Contract |
+| --- | --- |
+| Capability declaration | `Server.Capabilities` and `Client.Capabilities` carry `extensions: [String: Value]?`; `Server.Capabilities` also carries `experimental: [String: Value]?`. Both are emitted by legacy `initialize` and modern `server/discover` and by modern request `_meta` client capabilities. |
+| Extension modules | An extension with its own dependency graph is a separate SwiftPM module that composes `MCP` only through public and `package` API. |
+| Skills | `MCPSkills` owns the Skills extension. It is served on the legacy family and on `2026-07-28`; Skills cache fields are emitted only on `2026-07-28`. |
 
 ## Runtime Flows
 
@@ -258,6 +271,24 @@ not establish conformance for this task. The six authorization extensions
 are explicitly outside this task. The pending `json-schema-2020-12`,
 `http-header-validation`, and `http-custom-header-server-validation` entries
 are report-only and not scored.
+
+### Skills extension leg
+
+The Skills extension scenarios are not in the frozen `0.2.0-alpha.10` file.
+They are run by a separate referee pin,
+`@modelcontextprotocol/conformance@0.2.0-alpha.12`, through
+`scripts/run-conformance.sh --suite skills`, which does not change the frozen
+scored gate above.
+
+| Scenario | Primary owner | Behavioral proof boundary |
+| --- | --- | --- |
+| `sep-2640-skills-enumeration` | MCPSkills server | listing, entry rules, `skills/get`, unknown URI, SKILL.md read-back |
+| `sep-2640-skills-manifest` | MCPSkills server | SKILL.md resource metadata and name agreement |
+| `sep-2640-skills-directory` | MCPSkills server | `resources/directory/read` children, non-directory error, cursor |
+| `sep-2640-client-no-prefetch` | MCPSkills client | listing does not read resources |
+| `sep-2640-client-verify-digest` | MCPSkills client | digest mismatch refusal |
+| `sep-2640-client-verify-size` | MCPSkills client | size mismatch refusal |
+| `sep-2640-client-verify-frontmatter` | MCPSkills client | frontmatter mismatch refusal |
 
 ## State, Ownership, and Lifecycle
 

@@ -46,6 +46,7 @@ the conformance suite's report-only and pending extensions.
   - [Initialize Hook](#initialize-hook)
   - [HTTP Request Context in Handlers](#http-request-context-in-handlers)
   - [Graceful Shutdown](#graceful-shutdown)
+- [Skills Extension](#skills-extension)
 - [Transports](#transports)
 - [Authentication](#authentication)
   - [Client: Client Credentials Flow](#client-client-credentials-flow)
@@ -1344,6 +1345,64 @@ Configurable shutdown timeouts to prevent hanging processes
 `[ServiceLifecycle](https://swiftpackageindex.com/swift-server/swift-service-lifecycle/documentation/servicelifecycle)`
 also supports service dependencies, conditional services,
 and other useful features.
+
+## Skills Extension
+
+The `MCPSkills` product implements the MCP Skills extension
+(`io.modelcontextprotocol/skills`, SEP-2640) for both the legacy family and
+`2026-07-28`. Add it next to `MCP`:
+
+```swift
+.product(name: "MCPSkills", package: "swift-sdk")
+```
+
+### Serving skills
+
+A `SkillCatalog` loads every directory that contains a `SKILL.md`, validates
+it, and computes its manifest (SHA-256 digests and sizes). `withSkills`
+declares the extension, registers `skills/list`, `skills/get`, and
+`resources/directory/read`, and serves skill files through `resources/read`
+ahead of your own `resources/read` handler. The server must declare
+`resources`.
+
+```swift
+import MCP
+import MCPSkills
+
+let server = Server(
+    name: "SkillServer",
+    version: "1.0.0",
+    capabilities: .init(resources: .init())
+)
+let catalog = try SkillCatalog(directory: skillsDirectory)
+try await server.withSkills(catalog)
+```
+
+Conform to `SkillSource` (or `SkillDirectorySource`) to serve skills from
+another store. Invalid skills fail construction by default; pass
+`.init(policy: .skippingInvalidSkills)` to exclude them and inspect
+`catalog.issues` instead.
+
+### Using skills from a client
+
+`client.skills` checks the server's declaration before every call and
+verifies every read against the skill's manifest: size, SHA-256 digest, and,
+for `SKILL.md`, the YAML frontmatter.
+
+```swift
+let listing = try await client.skills.listAll()
+for rejected in listing.rejected {
+    print("Refused \(rejected.uri ?? "?"): \(rejected.reason)")
+}
+if let skill = listing.skills.first {
+    let manifest = try await client.skills.read(of: skill)          // SKILL.md
+    let forms = try await client.skills.read("references/FORMS.md", of: skill)
+    print(manifest.markdown?.body ?? "", forms.text ?? "")
+}
+```
+
+A file that is not in the manifest is refused before any request is sent,
+and a mismatch throws `SkillsClientError` instead of returning content.
 
 ## Transports
 

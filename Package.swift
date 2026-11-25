@@ -18,6 +18,9 @@ let package = Package(
         .library(
             name: "MCP",
             targets: ["MCP"]),
+        .library(
+            name: "MCPSkills",
+            targets: ["MCPSkills"]),
         .executable(
             name: "mcp-everything-server",
             targets: ["MCPConformanceServer"]),
@@ -31,6 +34,8 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-log.git", from: "1.5.0"),
         .package(url: "https://github.com/mattt/eventsource.git", from: "1.1.0"),
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
+        .package(url: "https://github.com/apple/swift-crypto.git", "3.0.0"..<"6.0.0"),
+        .package(url: "https://github.com/jpsim/Yams.git", from: "6.0.0"),
     ],
     targets: [
         .target(
@@ -54,6 +59,27 @@ let package = Package(
                 .enableUpcomingFeature("StrictConcurrency")
             ]
         ),
+        .target(
+            name: "MCPSkills",
+            dependencies: [
+                "MCP",
+                .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "Yams", package: "Yams"),
+                .product(name: "SystemPackage", package: "swift-system"),
+            ],
+            exclude: ["DESIGN.md"],
+            swiftSettings: [
+                .enableUpcomingFeature("StrictConcurrency")
+            ]
+        ),
+        .testTarget(
+            name: "MCPSkillsTests",
+            dependencies: [
+                "MCP",
+                "MCPSkills",
+                .product(name: "Crypto", package: "swift-crypto"),
+            ]
+        ),
         .testTarget(
             name: "MCPTests",
             dependencies: [
@@ -70,6 +96,7 @@ let package = Package(
             name: "MCPConformanceServer",
             dependencies: [
                 "MCP",
+                "MCPSkills",
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
@@ -82,6 +109,7 @@ let package = Package(
             name: "MCPConformanceClient",
             dependencies: [
                 "MCP",
+                "MCPSkills",
                 .product(name: "Logging", package: "swift-log"),
             ],
             path: "Sources/MCPConformance/Client",
