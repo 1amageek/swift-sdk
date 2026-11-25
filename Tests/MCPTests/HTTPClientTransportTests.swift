@@ -97,7 +97,7 @@ import Testing
 
     // MARK: - Mock URL Protocol
 
-    final class MockURLProtocol: URLProtocol, @unchecked Sendable {
+    final class MockURLProtocol: URLProtocol {
         static let requestHandlerStorage = RequestHandlerStorage()
         private let loadingState = URLProtocolLoadingState()
 
@@ -109,10 +109,6 @@ import Testing
             }
         }
 
-        func executeHandler(for request: URLRequest) async throws -> (HTTPURLResponse, Data) {
-            return try await Self.requestHandlerStorage.executeHandler(for: request)
-        }
-
         override class func canInit(with request: URLRequest) -> Bool {
             return true
         }
@@ -122,17 +118,8 @@ import Testing
         }
 
         override func startLoading() {
-            Task {
-                do {
-                    let (response, data) = try await self.executeHandler(for: request)
-                    guard loadingState.beginCompletion() else { return }
-                    client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-                    client?.urlProtocol(self, didLoad: data)
-                    client?.urlProtocolDidFinishLoading(self)
-                } catch {
-                    guard loadingState.beginCompletion() else { return }
-                    client?.urlProtocol(self, didFailWithError: error)
-                }
+            deliverResponse(guardedBy: loadingState) { request in
+                try await Self.requestHandlerStorage.executeHandler(for: request)
             }
         }
 
