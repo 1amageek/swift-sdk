@@ -22,8 +22,15 @@ protocol values and wire rules. Transport owns byte movement and HTTP/stdio
 lifetimes. Authorization owns client-side OAuth policy.
 
 The module does not own application input, UI, persistence, an authorization
-server, a conformance protocol fork, or the Tasks extension. It does not split
-the current package into feature packages merely to represent design layers.
+server, a conformance protocol fork, the Tasks extension, or the Skills
+extension. It does not split the current package into feature packages merely
+to represent design layers.
+
+For extension modules in the same package (currently `MCPSkills`), the module
+provides generic extension support: lossless `extensions` capability fields,
+`package` access to the negotiated `ConnectionInfo`, and `package` mounting of
+resource namespaces on `Server`. No extension-specific method name or type is
+known to this module.
 
 ## Related Designs
 
@@ -68,6 +75,7 @@ persist application credentials.
 | Error visibility | Invalid wire data, unsupported versions/capabilities, cancellation, disconnect, and resource-bound exhaustion remain observable typed failures. |
 | Direction | Client/Server may depend on Base and Transport contracts; Base never depends on Client, Server, or transport implementations. |
 | Extension scope | Roots, Sampling, Logging, DCR, and other valid 2026 contracts remain represented where applicable; Tasks is not implemented in this work. |
+| Extension support | `Server.Capabilities.{experimental, extensions}` and `Client.Capabilities.extensions` are `[String: Value]?`, additive, and survive legacy `initialize`, modern `server/discover`, and modern request `_meta`. Extension modules read `Client.connectionInfo` (set for both eras) and mount resource namespaces through `package` API. |
 
 ## Runtime Flows
 

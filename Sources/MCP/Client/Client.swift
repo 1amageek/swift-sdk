@@ -197,17 +197,22 @@ public actor Client {
         public var experimental: [String: String]?
         /// Whether the client supports roots
         public var roots: Capabilities.Roots?
+        /// Extension capabilities keyed by extension identifier. Each value is
+        /// the extension's settings object.
+        public var extensions: [String: Value]?
 
         public init(
             sampling: Sampling? = nil,
             elicitation: Elicitation? = nil,
             experimental: [String: String]? = nil,
-            roots: Capabilities.Roots? = nil
+            roots: Capabilities.Roots? = nil,
+            extensions: [String: Value]? = nil
         ) {
             self.sampling = sampling
             self.elicitation = elicitation
             self.experimental = experimental
             self.roots = roots
+            self.extensions = extensions
         }
     }
 
@@ -241,7 +246,11 @@ public actor Client {
     /// The server instructions
     var instructions: String?
 
-    var connectionInfo: ConnectionInfo?
+    /// The protocol facts negotiated for the active connection, in either era.
+    ///
+    /// Extension modules in this package read the negotiated era and server
+    /// capabilities from this value.
+    package internal(set) var connectionInfo: ConnectionInfo?
     var transportDelivery: TransportDelivery?
     var negotiationProbeID: ID?
     var cancellationHandlerRegistered = false
@@ -284,7 +293,29 @@ public actor Client {
         try await establishConnection(transport: transport, delivery: .byteStream)
 
         // Automatically initialize after connecting
-        return try await _initialize()
+        let result = try await _initialize()
+        try recordLegacyConnection(result)
+        return result
+    }
+
+    /// Records the negotiated legacy facts for extension modules.
+    ///
+    /// A server that answers with a revision outside `Version.supported`
+    /// leaves `connectionInfo` unset: the legacy `connect` contract keeps its
+    /// existing behavior, and extension modules report the connection as not
+    /// negotiated instead of guessing its era.
+    private func recordLegacyConnection(_ result: Initialize.Result) throws {
+        guard Version.supported.contains(result.protocolVersion) else {
+            connectionInfo = nil
+            return
+        }
+        connectionInfo = try ConnectionInfo(
+            era: .legacy,
+            protocolVersion: result.protocolVersion,
+            serverCapabilities: try capabilitySet(from: result.capabilities),
+            serverInfo: implementationInfo(from: result.serverInfo),
+            instructions: result.instructions
+        )
     }
 
     /// Disconnect the client and cancel all pending requests

@@ -79,6 +79,7 @@ their internal state to callers.
 | MRTR | Client accepts only the supported input requests for `tools/call`, `prompts/get`, and `resources/read`, routes each key to the application handler, preserves the opaque untrusted `requestState` exactly, and owns the `maxRounds = 10` loop. Integrity policy is application/conformance policy, not Client state validation. |
 | Subscriptions | Client demultiplexes acknowledged modern subscription streams, requires acknowledgement ordering, and cancels/cleans each stream without treating a subscription as a connection session. |
 | Application ownership | User input, approval, persistence, and task scheduling remain outside Client. |
+| Extension visibility | `Client.Capabilities.extensions` is sent in legacy `initialize` and in modern request `_meta`. `connectionInfo` is recorded for the legacy `connect(transport:)` path as well (era `legacy`, server capabilities from the `initialize` result), so extension modules read one `package` value for either era. |
 
 ### Stdio negotiation decision
 
@@ -151,7 +152,7 @@ sequenceDiagram
 | --- | --- | --- |
 | active raw connection | Client actor reference + abstract Transport actor | explicit connect through disconnect |
 | selected delivery kind | Client actor | explicit modern/dual connect through disconnect; it determines raw versus HTTP request delivery without identifying a concrete transport |
-| negotiated `ConnectionInfo` | Client actor | configured origin lifetime, ending on origin configuration change or explicit disconnect/defined terminal condition; modern HTTP request metadata is not stored as session state |
+| negotiated `ConnectionInfo` (both eras) | Client actor | configured origin lifetime, ending on origin configuration change or explicit disconnect/defined terminal condition; modern HTTP request metadata is not stored as session state |
 | discovery timer | current Client negotiation attempt | one discovery send through its classified response, timeout, cancellation, or disconnect; at most two sequential attempts and no retained timer afterward |
 | pending request table | Client actor | request registration through one terminal outcome |
 | outbound delivery task | Client actor request/subscription state | send start through response, send failure, local/remote cancellation, disconnect, malformed input, or subscription terminal outcome; local cancellation does not depend on peer cooperation |

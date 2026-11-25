@@ -101,6 +101,27 @@ extension Server {
         return self
     }
 
+    /// Routes modern `resources/read` through the mounted namespaces before
+    /// the application handler. Namespace results are always complete.
+    private func mountedResourceReadHandler(
+        fallback: ModernRequestHandlerBox?
+    ) -> ModernRequestHandlerBox {
+        let namespaces = resourceNamespaces
+        return ModernRequestHandlerBox { request in
+            let typedRequest = try Self.decode(request, as: ReadResource.self)
+            if let result = try await Self.readMountedResource(
+                typedRequest.params,
+                from: namespaces
+            ) {
+                return .complete(value: try Value(result), metadata: nil, cacheHint: nil)
+            }
+            guard let fallback else {
+                throw MCPError.resourceNotFound(uri: typedRequest.params.uri)
+            }
+            return try await fallback(request)
+        }
+    }
+
     private static func decode<M: Method>(
         _ request: AnyRequest,
         as type: M.Type
@@ -543,7 +564,7 @@ extension Server {
             )
         }
 
-        guard let handler = modernMethodHandlers[request.method]
+        let applicationHandler = modernMethodHandlers[request.method]
             ?? methodHandlers[request.method].map({ legacyHandler in
                 ModernRequestHandlerBox { request in
                     let response = try await legacyHandler(request)
@@ -555,7 +576,13 @@ extension Server {
                     }
                 }
             })
-        else {
+        let registeredHandler: ModernRequestHandlerBox?
+        if request.method == ReadResource.name, !resourceNamespaces.isEmpty {
+            registeredHandler = mountedResourceReadHandler(fallback: applicationHandler)
+        } else {
+            registeredHandler = applicationHandler
+        }
+        guard let handler = registeredHandler else {
             throw MCPError.methodNotFound("Unknown method: \(request.method)")
         }
 
@@ -1134,6 +1161,12 @@ extension Server {
             var value: [String: Value] = [:]
             if let listChanged = tools.listChanged { value["listChanged"] = .bool(listChanged) }
             fields["tools"] = .object(value)
+        }
+        if let experimental = capabilities.experimental {
+            fields["experimental"] = .object(experimental)
+        }
+        if let extensions = capabilities.extensions {
+            fields["extensions"] = .object(extensions)
         }
         return fields
     }

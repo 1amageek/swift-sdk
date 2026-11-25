@@ -189,19 +189,29 @@ public actor Server {
         public var resources: Resources?
         /// Tools capabilities
         public var tools: Tools?
+        /// Experimental, non-standard capabilities keyed by name.
+        public var experimental: [String: Value]?
+        /// Extension capabilities keyed by extension identifier
+        /// (for example `io.modelcontextprotocol/skills`). Each value is the
+        /// extension's settings object.
+        public var extensions: [String: Value]?
 
         public init(
             completions: Completions? = nil,
             logging: Logging? = nil,
             prompts: Prompts? = nil,
             resources: Resources? = nil,
-            tools: Tools? = nil
+            tools: Tools? = nil,
+            experimental: [String: Value]? = nil,
+            extensions: [String: Value]? = nil
         ) {
             self.completions = completions
             self.logging = logging
             self.prompts = prompts
             self.resources = resources
             self.tools = tools
+            self.experimental = experimental
+            self.extensions = extensions
         }
     }
 
@@ -242,6 +252,8 @@ public actor Server {
     var modernMethodHandlers: [String: ModernRequestHandlerBox] = [:]
     /// Notification handlers
     var notificationHandlers: [String: [NotificationHandlerBox]] = [:]
+    /// Resource namespaces mounted by extension modules, in mount order.
+    var resourceNamespaces: [ResourceNamespace] = []
     /// Pending request tasks (for cancellation support)
     private var pendingRequestTasks: [ID: Task<Response<AnyMethod>, Error>] = [:]
 
@@ -836,8 +848,18 @@ public actor Server {
             }
         }
 
-        // Find handler for method name
-        guard let handler = methodHandlers[request.method] else {
+        // Find handler for method name. While extension modules have mounted
+        // resource namespaces, `resources/read` is routed through them first.
+        let registeredHandler: RequestHandlerBox?
+        if request.method == ReadResource.name, !resourceNamespaces.isEmpty {
+            registeredHandler = MountedResourceReadHandler(
+                namespaces: resourceNamespaces,
+                applicationHandler: methodHandlers[request.method]
+            )
+        } else {
+            registeredHandler = methodHandlers[request.method]
+        }
+        guard let handler = registeredHandler else {
             let error = MCPError.methodNotFound("Unknown method: \(request.method)")
             let response = AnyMethod.response(id: request.id, error: error)
 
