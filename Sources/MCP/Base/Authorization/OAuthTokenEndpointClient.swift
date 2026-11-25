@@ -43,7 +43,7 @@ struct OAuthTokenEndpointClient: Sendable {
         )
         urlRequest.httpBody = encodeForm(parameters)
 
-        let (data, response) = try await session.data(for: urlRequest)
+        let (data, response) = try await session.mcpData(for: urlRequest)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw OAuthAuthorizationError.tokenRequestFailed(statusCode: -1, oauthError: nil)
         }

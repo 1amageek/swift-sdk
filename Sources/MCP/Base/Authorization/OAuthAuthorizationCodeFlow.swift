@@ -169,9 +169,9 @@ public struct OAuthAuthorizationCodeFlow: Sendable {
             delegate: noRedirectDelegate,
             delegateQueue: nil
         )
-        defer { noRedirectSession.invalidateAndCancel() }
+        defer { noRedirectSession.mcpInvalidate() }
 
-        let (_, response) = try await noRedirectSession.data(for: request)
+        let (_, response) = try await noRedirectSession.mcpData(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw OAuthAuthorizationError.authorizationResponseMissingRedirectLocation
         }

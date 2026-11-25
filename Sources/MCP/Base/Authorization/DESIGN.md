@@ -123,6 +123,11 @@ state.
   across suspension points. `TokenStorage` implementations own
   synchronization required by their public `Sendable` contract.
 - Authorization does not inspect or mutate HTTP server exchange state.
+- Every metadata, registration, token, and authorization-redirect request is
+  loaded through the Transport layer's `URLSession.mcpData(for:)`, and the
+  redirect session is released with `mcpInvalidate()`. FoundationNetworking
+  traps when a task is cancelled while it completes, so Authorization never
+  calls `data(for:)` or cancels a task directly.
 
 ## Verification and Change Impact
 

@@ -202,7 +202,7 @@ public actor HTTPClientTransport: Transport, HTTPRequestSendingTransport {
         streamingTask?.cancel()
         streamingTask = nil
 
-        session.invalidateAndCancel()
+        session.mcpInvalidate()
         messageContinuation.finish()
 
         initialSessionIDSignalTask?.cancel()
@@ -291,7 +291,7 @@ public actor HTTPClientTransport: Transport, HTTPRequestSendingTransport {
 
             do {
                 #if os(Linux)
-                    let (responseData, response) = try await session.mcpTransportData(for: request)
+                    let (responseData, response) = try await session.mcpData(for: request)
                     try await processResponse(
                         response: response,
                         data: responseData,

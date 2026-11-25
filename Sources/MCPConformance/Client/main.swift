@@ -332,7 +332,7 @@ private func requestOAuthToken(
     }
     request.httpBody = formURLEncodedBody(parameters)
 
-    let (data, response) = try await session.data(for: request)
+    let (data, response) = try await session.mcpData(for: request)
     guard let httpResponse = response as? HTTPURLResponse else {
         throw ConformanceError.invalidArguments("Token endpoint returned an invalid response")
     }
