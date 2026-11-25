@@ -65,7 +65,7 @@ the conformance suite's report-only and pending extensions.
 
 ## Requirements
 
-- Swift 6.1+ (Xcode 16.4+)
+- Swift 6.4+ (Xcode 27+)
 
 See the [Platform Availability](#platform-availability) section below
 for platform-specific requirements.
@@ -1667,7 +1667,7 @@ The Swift SDK has the following platform requirements:
 | Linux              | Distributions with `glibc` or `musl`, including Ubuntu, Debian, Fedora, and Alpine Linux |
 
 
-While the core library works on any platform supporting Swift 6
+While the core library works on any platform supporting Swift 6.4
 (including Linux), running a client or server requires a compatible transport.
 
 ## Debugging and Logging

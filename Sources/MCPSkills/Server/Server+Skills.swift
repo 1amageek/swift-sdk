@@ -60,7 +60,7 @@ extension Server {
 ///
 /// The server is held weakly because the handlers are stored by the server.
 struct SkillsRequestHandler<Source: SkillSource>: Sendable {
-    private weak var server: Server?
+    private weak let server: Server?
     private let source: Source
     private let cacheHint: CacheHint?
 
