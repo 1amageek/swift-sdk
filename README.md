@@ -78,7 +78,7 @@ Add the following to your `Package.swift` file:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/1amageek/swift-sdk.git", exact: "0.14.0")
+    .package(url: "https://github.com/1amageek/swift-sdk.git", exact: "0.15.0")
 ]
 ```
 
